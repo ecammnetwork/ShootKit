@@ -47,7 +47,7 @@
     [super viewDidLoad];
     shootCameras = [[NSMutableSet alloc] init];
     latestVideoPencilBuffer = nil;
-    videoPencilQueue = videoPencilQueue = dispatch_queue_create("Video Pencil Return",
+    videoPencilQueue = dispatch_queue_create("Video Pencil Return",
                                                                 dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     self.shootServer = [[ShootServer alloc] initWithName: @"Obj-C Demo" delegate: self];
     self.videoPencilClient = [[VideoPencilClient alloc] initWithName: @"Obj-C Demo" size: CGSizeMake(1920, 1080) delegate: self queue: videoPencilQueue ciContext:nil];
@@ -121,7 +121,7 @@
 
     CIImage* frame = [[CIImage alloc] initWithCVPixelBuffer:CMSampleBufferGetImageBuffer(sampleBuffer)];
     NSError * error;
-    [self.videoPencilClient sendFrame:frame presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()) presentationDuration:CMTimeMake(1, 30) error:&error];
+    [self.videoPencilClient sendFrame:frame presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer) presentationDuration:CMSampleBufferGetDuration(sampleBuffer) error:&error];
 }
 
 

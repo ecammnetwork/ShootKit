@@ -34,10 +34,10 @@ extension VideoPencilState: AVCaptureVideoDataOutputSampleBufferDelegate{
         // Keep a buffer to display in the demo
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let frame = CIImage(cvPixelBuffer: pixelBuffer)
-//        latestCameraFrame = frame
+        latestCameraFrame = frame
         
         // Send to Video Pencil
-        try? videoPencilClient?.sendFrame(frame, presentationTimeStamp: CMClockGetHostTimeClock().time, presentationDuration: CMTime(value: 1, timescale: 30))
+        try? videoPencilClient?.sendFrame(frame, presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), presentationDuration: CMSampleBufferGetDuration(sampleBuffer))
     }
     
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) { }

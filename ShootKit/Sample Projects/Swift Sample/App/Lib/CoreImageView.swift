@@ -62,7 +62,9 @@ struct CoreImageView: NSViewRepresentable {
 
             var composited: CIImage?
             if let camera, let drawing {
-                composited = drawing.composited(over: camera)
+                composited = drawing
+                    .premultiplyingAlpha()
+                    .composited(over: camera)
             } else {
                 composited = drawing ?? camera
             }

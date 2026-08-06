@@ -10,6 +10,18 @@ ShootKit lets you add [Shoot](https://squares.tv/shoot) and [Video Pencil](https
 * Enumerate and switch Shoot's camera sources 
 * Shoot control panel using SwiftUI (use NSHostingController to add to your non-SwiftUI or Objective-C project)
 
+## Installation
+
+```
+pod 'ShootKit', git: 'https://github.com/goodtohear/ShootKit.git', branch: 'main'
+```
+
+Add to Bonjour Services (Info.plist)
+```
+ _videopencil_ios._tcp
+ _shoot_receiver._tcp
+ ```
+
 ## VideoPencilClient
 The [Video Pencil](https://videopencil.com?ct=ShootKit) client lets you:
 1. Send a video feed to the iPad
@@ -17,6 +29,8 @@ The [Video Pencil](https://videopencil.com?ct=ShootKit) client lets you:
 
 ### Objective-C
 ```objectivec
+@import ShootKit;
+
 // Create VideoPencilClient
 self.videoPencilClient =  [
     [VideoPencilClient alloc] initWithName: @"My Video App"
