@@ -31,8 +31,6 @@ import CoreImage
     var ciContext: CIContext
     var referencePixelBuffer: CVPixelBuffer?
     var scaledReferencePixelBuffer: CVPixelBuffer?
-    var videoPencilFormatDescription: CMFormatDescription?
-    
     
     var encoder: H265Encoder?
     
@@ -242,13 +240,18 @@ import CoreImage
         case sampleBufferNotCreated
     }
     @objc public func sendFrame(_ image: CIImage, presentationTimeStamp: CMTime, presentationDuration: CMTime) throws{
+        guard let connection = connection,
+              let encoder = encoder,
+              connection.state == .ready
+        else { return }
+        
         var pixelBuffer: CVPixelBuffer?
         let minDimension = min(image.extent.height, image.extent.width)
         if minDimension > 1080{
             // scale it down
             let scale = 1080 / minDimension
             let scaled = image.transformed(by: .init(scaleX: scale, y: scale))
-            if let current = scaledReferencePixelBuffer, CVPixelBufferGetWidth(current) == Int(image.extent.width), CVPixelBufferGetHeight(current) != Int(image.extent.height){
+            if let current = scaledReferencePixelBuffer, CVPixelBufferGetWidth(current) == Int(image.extent.width), CVPixelBufferGetHeight(current) == Int(image.extent.height){
                 
             }else{
                 scaledReferencePixelBuffer = CIImage.createPixelBuffer(width: Int(scaled.extent.width), height: Int(scaled.extent.height))
@@ -264,7 +267,6 @@ import CoreImage
             }else{
                 if referencePixelBuffer == nil || CVPixelBufferGetWidth(referencePixelBuffer!) != Int(image.extent.width) || CVPixelBufferGetHeight(referencePixelBuffer!) != Int(image.extent.height){
                     referencePixelBuffer = CIImage.createPixelBuffer(width: Int(image.extent.width), height: Int(image.extent.height))
-                    videoPencilFormatDescription = nil
                 }
                 if let referencePixelBuffer{
                     ciContext.render(image, to: referencePixelBuffer)
@@ -273,30 +275,8 @@ import CoreImage
             }
         }
         guard let pixelBuffer  else { return }
+        encoder.encode(pixelBuffer: pixelBuffer, presentationTimeStamp: presentationTimeStamp, duration: presentationDuration)
         
-        if videoPencilFormatDescription == nil {
-            CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &videoPencilFormatDescription)
-        }
-        guard let videoPencilFormatDescription else { throw RenderError.formatDescriptionUnavailable }
-        var sampleBuffer: CMSampleBuffer?
-        var timingInfo = CMSampleTimingInfo(duration: presentationDuration, presentationTimeStamp: presentationDuration, decodeTimeStamp: .invalid)
-
-        let result = CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, dataReady: true, makeDataReadyCallback: nil, refcon: nil, formatDescription: videoPencilFormatDescription, sampleTiming: &timingInfo, sampleBufferOut: &sampleBuffer)
-        guard let sampleBuffer else {
-            print("Sample Buffer Result: \(result)")
-            self.videoPencilFormatDescription = nil
-            throw RenderError.sampleBufferNotCreated
-        }
-        send(sampleBuffer: sampleBuffer)
-    }
-    
-    @objc public func send(sampleBuffer: CMSampleBuffer){
-        guard let connection = connection,
-              let encoder = encoder,
-              connection.state == .ready
-        else { return }
-
-        encoder.encode(sampleBuffer)
     }
     
     public func stop(){

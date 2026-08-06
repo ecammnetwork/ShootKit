@@ -84,7 +84,7 @@ class H265Encoder {
         //Set whether to generate B frames (because B frames are not necessary when decoding, B frames can be discarded)
         VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         //Set key frame interval
-        var frameInterval = 10
+        var frameInterval = 30
         let number = CFNumberCreate(kCFAllocatorDefault, CFNumberType.intType, &frameInterval)
         VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: number)
         
@@ -102,12 +102,12 @@ class H265Encoder {
         let bitRatesLimit :CFArray = [bitRate * 2,1] as CFArray
         VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_DataRateLimits, value: bitRatesLimit)
         
-        VTSessionSetProperty(encodeSession, key: kVTVideoEncoderList_IsHardwareAccelerated, value: hevcSupported ? kCFBooleanTrue : kCFBooleanFalse)
-        
-        if #available(iOS 14.5,macOS 11.3, *) {
+        VTSessionSetProperty(encodeSession, key: kVTVideoEncoderList_IsHardwareAccelerated, value: kCFBooleanTrue)
+//        
+        if #available(macOS 11.3, *) {
             VTSessionSetProperty(encodeSession, key: kVTVideoEncoderSpecification_EnableLowLatencyRateControl, value: kCFBooleanTrue)
-      
         }
+        
 //        VTSessionSetProperty(encodeSession, key: kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, value: kCFBooleanTrue)
         
     }
@@ -181,24 +181,20 @@ class H265Encoder {
 
     
     //Start coding
-    func encode(_ sampleBuffer:CMSampleBuffer){
+    func encode(pixelBuffer:CVPixelBuffer, presentationTimeStamp:CMTime, duration:CMTime){
         guard VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) else { return }
         if self.encodeSession == nil {
             initVideoToolBox()
         }
         encodeQueue.async {[weak self] in
-            guard let self = self, var imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let encodeSession = self.encodeSession else { return }
-//        encodeQueue.async {
-//            guard var imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let encodeSession = self.encodeSession else { return }
-//            imageBuffer = Unmanaged<CVImageBuffer>.passUnretained(imageBuffer).takeRetainedValue()
-            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            let duration = CMSampleBufferGetDuration(sampleBuffer)
-//            let time = CMTime(value: self.frameID, timescale: 100)
+            guard let self = self, let encodeSession = self.encodeSession else { return }
             var flags: VTEncodeInfoFlags = VTEncodeInfoFlags()
-            let state = VTCompressionSessionEncodeFrame(encodeSession, imageBuffer: imageBuffer, presentationTimeStamp: time, duration: duration, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+            let state = VTCompressionSessionEncodeFrame(encodeSession, imageBuffer: pixelBuffer, presentationTimeStamp: presentationTimeStamp, duration: duration, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
             if state != noErr{
-                self.delegate?.log(message: "encode failure \(OSErrorCodeDescription(state))", color: .red)
-                self.delegate?.videoEncoderDidFail(self, error: state)
+                callBackQueue.async{
+                    self.delegate?.log(message: "encode failure \(OSErrorCodeDescription(state))", color: .red)
+                    self.delegate?.videoEncoderDidFail(self, error: state)
+                }
             }
         }
         
