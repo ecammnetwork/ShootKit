@@ -9,30 +9,34 @@ import Foundation
 import Network
 import VideoToolbox
 import AppKit
+import CoreImage
 
 @objc public protocol VideoPencilClientDelegate: AnyObject{
-    var videoPencilClientShouldCreateSampleBuffers: Bool { get }
-    
     func videoPencilDidConnect(_ client: VideoPencilClient)
     func videoPencilDidDisconnect(_ client: VideoPencilClient)
-    
-    func videoPencilDidReceive(from: VideoPencilClient, pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime)
-    func videoPencilDidReceive(from: VideoPencilClient, sampleBuffer: CMSampleBuffer)
+    func videoPencilDidReceive(from: VideoPencilClient, frame: CIImage, presentationTimeStamp: CMTime, presentationDuration: CMTime)
 }
 
 @objc public class VideoPencilClient: NSObject, ObservableObject{
     public var logger = BaseConnectionLogger()
     
     @objc public var name: String
+    @objc public var size: CGSize
     
     @Published var hasReceivedControlMessage = false
     @Published var mostRecentVideoSelection: String?
     @Published var latestCompressedSampleBuffer: CMSampleBuffer?
     @Published var encoderBitRate: Int32 = 1920 * 1000
     
+    var ciContext: CIContext
+    var referencePixelBuffer: CVPixelBuffer?
+    var scaledReferencePixelBuffer: CVPixelBuffer?
+    var videoPencilFormatDescription: CMFormatDescription?
+    
+    
     var encoder: H265Encoder?
     
-    private let queue = DispatchQueue(label: "Video Pencil Client", qos: .userInitiated)
+    private let queue: DispatchQueue
     
     @Published var connection: NWConnection? // not visible outside ShootKit but this will trigger an objectWillChange.send() so that hasConnection will work
     
@@ -46,9 +50,12 @@ import AppKit
     
     weak var delegate: VideoPencilClientDelegate?
     
-    @objc public init(name: String, delegate: VideoPencilClientDelegate){
+    @objc public init(name: String, size: CGSize, delegate: VideoPencilClientDelegate, queue: DispatchQueue, ciContext: CIContext?=nil){
         self.name = name
+        self.size = size
         self.delegate = delegate
+        self.queue = queue
+        self.ciContext = ciContext ?? CIContext()
         super.init()
         startBonjourDiscovery()
     }
@@ -113,6 +120,9 @@ import AppKit
         
         connection.start(queue: queue)
         self.connection = connection
+        queue.async {
+            self.connection = connection // eesh
+        }
         awaitNextMessage()
     }
     func handleConnectionStateChanges(newState: NWConnection.State){
@@ -146,7 +156,7 @@ import AppKit
 
     func startVideoStream(){
         hasSentParameterSet = false
-        encoder = H265Encoder(width: 1920, height: 1080, bitRate: encoderBitRate, fps: 30)
+        encoder = H265Encoder(width: 1920, height: 1080, bitRate: encoderBitRate, fps: 30, callbackQueue: queue)
         encoder?.delegate = self
     }
     
@@ -219,14 +229,65 @@ import AppKit
     var decoder: H265Decoder?
     func createDecoderIfNeeded(){
         if decoder == nil {
-            decoder = H265Decoder()
-            decoder?.setConfig(width: 1920, height: 1080)
+            decoder = H265Decoder(width: 1920, height: 1080, callbackQueue: queue)
             decoder?.delegate = self
         }
     }
     func decode(frame: Data){
         createDecoderIfNeeded()
         decoder?.decode(frame)
+    }
+    @objc enum RenderError: Int, Error{
+        case formatDescriptionUnavailable
+        case sampleBufferNotCreated
+    }
+    @objc public func sendFrame(_ image: CIImage, presentationTimeStamp: CMTime, presentationDuration: CMTime) throws{
+        var pixelBuffer: CVPixelBuffer?
+        let minDimension = min(image.extent.height, image.extent.width)
+        if minDimension > 1080{
+            // scale it down
+            let scale = 1080 / minDimension
+            let scaled = image.transformed(by: .init(scaleX: scale, y: scale))
+            if let current = scaledReferencePixelBuffer, CVPixelBufferGetWidth(current) == Int(image.extent.width), CVPixelBufferGetHeight(current) != Int(image.extent.height){
+                
+            }else{
+                scaledReferencePixelBuffer = CIImage.createPixelBuffer(width: Int(scaled.extent.width), height: Int(scaled.extent.height))
+            }
+            if let scaledReferencePixelBuffer{
+                ciContext.render(scaled, to: scaledReferencePixelBuffer)
+            }
+            pixelBuffer = scaledReferencePixelBuffer
+            
+        }else{
+            if let b = image.pixelBuffer{
+                pixelBuffer = b
+            }else{
+                if referencePixelBuffer == nil || CVPixelBufferGetWidth(referencePixelBuffer!) != Int(image.extent.width) || CVPixelBufferGetHeight(referencePixelBuffer!) != Int(image.extent.height){
+                    referencePixelBuffer = CIImage.createPixelBuffer(width: Int(image.extent.width), height: Int(image.extent.height))
+                    videoPencilFormatDescription = nil
+                }
+                if let referencePixelBuffer{
+                    ciContext.render(image, to: referencePixelBuffer)
+                    pixelBuffer = referencePixelBuffer
+                }
+            }
+        }
+        guard let pixelBuffer  else { return }
+        
+        if videoPencilFormatDescription == nil {
+            CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &videoPencilFormatDescription)
+        }
+        guard let videoPencilFormatDescription else { throw RenderError.formatDescriptionUnavailable }
+        var sampleBuffer: CMSampleBuffer?
+        var timingInfo = CMSampleTimingInfo(duration: presentationDuration, presentationTimeStamp: presentationDuration, decodeTimeStamp: .invalid)
+
+        let result = CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, dataReady: true, makeDataReadyCallback: nil, refcon: nil, formatDescription: videoPencilFormatDescription, sampleTiming: &timingInfo, sampleBufferOut: &sampleBuffer)
+        guard let sampleBuffer else {
+            print("Sample Buffer Result: \(result)")
+            self.videoPencilFormatDescription = nil
+            throw RenderError.sampleBufferNotCreated
+        }
+        send(sampleBuffer: sampleBuffer)
     }
     
     @objc public func send(sampleBuffer: CMSampleBuffer){
@@ -246,6 +307,34 @@ import AppKit
     }
 }
 
+extension CIImage{
+    static func createPixelBuffer(width: Int, height: Int)->CVPixelBuffer?{
+        guard width > 0 && height > 0 else { return nil }
+        
+        var copiedBuffer: CVPixelBuffer?
+        
+        let pixelFormat = kCVPixelFormatType_32BGRA //CVPixelBufferGetPixelFormatType(pixelBuffer)
+        
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+            kCVPixelBufferMetalCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+        ]
+        
+        CVPixelBufferCreate(
+            nil,
+            width,
+            height,
+            pixelFormat,
+            attrs as CFDictionary,
+            &copiedBuffer
+        )
+        
+        return copiedBuffer
+    }
+}
 
 extension VideoPencilClient: H265EncoderDelegate{
     func videoEncoderDidExtractParameterSet(_ encoder: H265Encoder, parameterSet frames: [Data]) {
@@ -266,7 +355,10 @@ extension VideoPencilClient: H265EncoderDelegate{
         }))
     }
     func videoEncoderDidYieldVideoData(_ encoder: H265Encoder, compressedVideo data: Data) {
-        guard let connection = connection, hasSentParameterSet else { return }
+        guard let connection = connection, hasSentParameterSet else {
+            log("VideoPencilClient Ignoring frame, no keyframe received yet", color: .orange)
+            return
+        }
         guard data.underestimatedCount > 0 else {
             log(message: "Skipped sending nil data", color: .yellow)
             return
@@ -303,19 +395,12 @@ extension VideoPencilClient: ConnectionLogger{
 }
 
 extension VideoPencilClient: H265DecoderDelegate{
-    var shouldCreateSampleBuffers: Bool {
-        delegate?.videoPencilClientShouldCreateSampleBuffers ?? true
-    }
     
     func videoDecoderDidDecodePixelBuffer(_ decoder: H265Decoder, pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
-        delegate?.videoPencilDidReceive(from: self, pixelBuffer: pixelBuffer, presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
+        delegate?.videoPencilDidReceive(from: self, frame: CIImage(cvPixelBuffer: pixelBuffer), presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
     }
-    func videoDecoderDidDecodeSampleBuffer(_ decoder: H265Decoder, sampleBuffer: CMSampleBuffer) {
-        DispatchQueue.main.async {
-            self.delegate?.videoPencilDidReceive(from: self, sampleBuffer: sampleBuffer)
-        }
-    }
+    
     func videoDecoder(_ decoder: H265Decoder, failedWith error: OSStatus) {
-        
+        // handle error
     }
 }

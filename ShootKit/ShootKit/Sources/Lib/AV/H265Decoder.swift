@@ -10,20 +10,18 @@ import VideoToolbox
 import OSLog
 
 protocol H265DecoderDelegate:AnyObject, ConnectionLogger{
-    var shouldCreateSampleBuffers: Bool { get }
     func videoDecoder(_ decoder: H265Decoder, failedWith error: OSStatus)
     func videoDecoderDidDecodePixelBuffer(_ decoder: H265Decoder, pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime)
-    func videoDecoderDidDecodeSampleBuffer(_ decoder : H265Decoder, sampleBuffer: CMSampleBuffer)
 }
 
 class H265Decoder {
     weak var delegate : H265DecoderDelegate?
     var expectsNalu: Bool = true
-    var width: Int32 = 1920
-    var height:Int32 = 1080
+    var width: Int32
+    var height:Int32
     
     var decodeQueue = DispatchQueue(label: "decode") // both serial queues
-    var callBackQueue = DispatchQueue(label: "decodeCallBack")
+    var callBackQueue:DispatchQueue
     var decodeDesc : CMVideoFormatDescription?
     
     var parameterSet: [Data]?{
@@ -45,9 +43,10 @@ class H265Decoder {
 
     
     
-    func setConfig(width: Int32, height: Int32) {
+    public init( width: Int32, height: Int32, callbackQueue: DispatchQueue) {
         self.width = width
         self.height = height
+        self.callBackQueue = callbackQueue
     }
     
     func initDecoder() -> Bool {
@@ -187,34 +186,14 @@ class H265Decoder {
                 }
                 guard let imageBuffer = imageBuffer else {
                     delegate.log(message: "Decoding error: Image buffer creation failed - \(ErrorCodeLookup[status] ?? "\(status)")", color: .red)
-                    delegate.videoDecoder(decoder, failedWith: status)
+                    decoder.callBackQueue.async {
+                        delegate.videoDecoder(decoder, failedWith: status)
+                    }
                     return
                 }
                 decoder.callBackQueue.async {
                     delegate.videoDecoderDidDecodePixelBuffer(decoder, pixelBuffer: imageBuffer, presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
                 }
-                if delegate.shouldCreateSampleBuffers {
-                    var sampleBuffer: CMSampleBuffer?
-                    let now = CMClockGetTime(.hostTimeClock).convertScale(30, method: .roundAwayFromZero)
-                    
-                    var timimgInfo  = CMSampleTimingInfo(duration: .indefinite, presentationTimeStamp: now, decodeTimeStamp: now)
-                    var formatDescription: CMFormatDescription? = nil
-                    CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: imageBuffer, formatDescriptionOut: &formatDescription)
-                    
-                    let osStatus = CMSampleBufferCreateReadyWithImageBuffer(
-                        allocator: kCFAllocatorDefault,
-                        imageBuffer: imageBuffer,
-                        formatDescription: formatDescription!,
-                        sampleTiming: &timimgInfo,
-                        sampleBufferOut: &sampleBuffer
-                    )
-                    if osStatus == 0, let sampleBuffer = sampleBuffer{
-                        delegate.videoDecoderDidDecodeSampleBuffer(decoder, sampleBuffer: sampleBuffer)
-                    }else{
-                        delegate.log(message: "Error \(OSErrorCodeDescription(osStatus))", color: .systemRed)
-                    }
-                }
-                
             }
         }
     }
@@ -237,7 +216,7 @@ class H265Decoder {
     
     private func decode(frame:[UInt8],size:UInt32) {
         //
-        var blockBUffer :CMBlockBuffer?
+        var blockBuffer: CMBlockBuffer?
         var frame1 = frame
         //        var memoryBlock = frame1.withUnsafeMutableBytes({$0}).baseAddress
         //        var ddd = Data(bytes: frame, count: Int(size))
@@ -261,7 +240,7 @@ class H265Decoder {
                                                             offsetToData:0,
                                                             dataLength: Int(size),
                                                             flags: 0,
-                                                            blockBufferOut: &blockBUffer)
+                                                            blockBufferOut: &blockBuffer)
         if blockState != noErr {
             self.delegate?.log(message: "Failed to create blockBuffer \(OSErrorCodeDescription(blockState))", color: .red)
             return
@@ -282,7 +261,7 @@ class H265Decoder {
          Parameter 9: sampleBuffer object
          */
         let readyState = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault,
-                                                   dataBuffer: blockBUffer,
+                                                   dataBuffer: blockBuffer,
                                                    formatDescription: decodeDesc,
                                                    sampleCount: CMItemCount(1),
                                                    sampleTimingEntryCount: CMItemCount(),

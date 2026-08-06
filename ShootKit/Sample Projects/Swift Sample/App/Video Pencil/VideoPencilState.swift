@@ -8,21 +8,22 @@
 import Foundation
 import AVKit
 import ShootKit
-
+import CoreImage
 
 class VideoPencilState: NSObject, ObservableObject{
     @Published var isConnected = false
     
-    var videoPencilClient: VideoPencilClient!
-    var cameraSource: CameraSource!
-    
-    var videoPencilBuffers = BufferSource()
+    var videoPencilClient: VideoPencilClient?
+    var cameraSource: CameraSource?
+    var latestCameraFrame: CIImage?
+    var latestDrawingFrame: CIImage?
     var cameraBuffers = BufferSource()
+    let queue = DispatchQueue(label: "VideoPencilState", qos: .userInitiated)
     
     override init(){
         super.init()
-        cameraSource = CameraSource(captureDelegate: self)
-        videoPencilClient = VideoPencilClient(name: "Swift Sample", delegate: self)
+        cameraSource = CameraSource(captureDelegate: self, queue: queue)
+        videoPencilClient = VideoPencilClient(name: "Swift Sample", size: CGSize(width: 1920, height: 1080), delegate: self, queue: queue, ciContext: nil)
     }
     
 }
@@ -31,10 +32,12 @@ class VideoPencilState: NSObject, ObservableObject{
 extension VideoPencilState: AVCaptureVideoDataOutputSampleBufferDelegate{
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         // Keep a buffer to display in the demo
-        cameraBuffers.latestSampleBuffer = sampleBuffer
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let frame = CIImage(cvPixelBuffer: pixelBuffer)
+//        latestCameraFrame = frame
         
         // Send to Video Pencil
-        videoPencilClient.send(sampleBuffer: sampleBuffer)
+        try? videoPencilClient?.sendFrame(frame, presentationTimeStamp: CMClockGetHostTimeClock().time, presentationDuration: CMTime(value: 1, timescale: 30))
     }
     
     func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) { }
@@ -43,14 +46,8 @@ extension VideoPencilState: AVCaptureVideoDataOutputSampleBufferDelegate{
 
 // Receive transparent frames from Video Pencil
 extension VideoPencilState: VideoPencilClientDelegate{
-    var videoPencilClientShouldCreateSampleBuffers: Bool {
-        true // save extra processing work by setting this to false if you just want pixel buffers
-    }
-    func videoPencilDidReceive(from: VideoPencilClient, pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
-        // We're using sample buffers for this demo but you can take the pixelBuffer instead by implementing this method.
-    }
-    func videoPencilDidReceive(from: VideoPencilClient, sampleBuffer: CMSampleBuffer) {
-        videoPencilBuffers.latestSampleBuffer = sampleBuffer
+    func videoPencilDidReceive(from: VideoPencilClient, frame: CIImage, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
+        self.latestDrawingFrame = frame
     }
     func videoPencilDidConnect(_ client: VideoPencilClient) {
         DispatchQueue.main.async {
@@ -65,6 +62,6 @@ extension VideoPencilState: VideoPencilClientDelegate{
 }
 
 // helper class to drive the SampleBufferPlayer
-class BufferSource: SampleBufferSource{
+final class BufferSource: SampleBufferSource{
     var latestSampleBuffer: CMSampleBuffer?
 }

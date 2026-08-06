@@ -21,9 +21,10 @@ class CameraSource: ObservableObject{
     
     let output = AVCaptureVideoDataOutput()
     let session = AVCaptureSession()
-    let queue = DispatchQueue(label: "camera", qos: .userInteractive)
+    let queue: DispatchQueue
     
-    init(captureDelegate: AVCaptureVideoDataOutputSampleBufferDelegate) {
+    init(captureDelegate: AVCaptureVideoDataOutputSampleBufferDelegate, queue: DispatchQueue) {
+        self.queue = queue
         buildCaptureSession(captureDelegate: captureDelegate)
         selectedCamera = availableDevices.first
     }

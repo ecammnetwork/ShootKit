@@ -5,6 +5,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_shoot_receiver._tcp</string>
+		<string>_videopencil_ios._tcp</string>
 	</array>
 </dict>
 </plist>

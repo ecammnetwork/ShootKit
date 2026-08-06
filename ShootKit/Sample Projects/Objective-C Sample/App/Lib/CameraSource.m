@@ -59,4 +59,12 @@
     [session startRunning];
 }
 
+- (void)selectCameraNamed:(NSString *)name{
+    for (AVCaptureDevice * camera in self.availableCameras) {
+        if([camera.localizedName isEqualToString: name]){
+            [self selectCamera: camera];
+        }
+    }
+}
+
 @end

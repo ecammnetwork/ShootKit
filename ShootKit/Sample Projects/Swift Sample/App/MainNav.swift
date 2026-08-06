@@ -10,13 +10,13 @@ import SwiftUI
 struct MainNav: View {
     var body: some View {
         TabView{
-            ShootDemoView()
-                .tabItem {
-                    Text("Shoot")
-                }
             VideoPencilDemoView()
                 .tabItem{
                     Text("Video Pencil")
+                }
+            ShootDemoView()
+                .tabItem {
+                    Text("Shoot")
                 }
         }.padding()
     }

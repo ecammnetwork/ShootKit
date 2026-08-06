@@ -17,6 +17,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(strong, nonatomic) AVCaptureDevice* selectedCamera;
 
 -(void)selectCamera: (AVCaptureDevice* )camera;
+-(void)selectCameraNamed: (NSString* )name;
 
 @end
 

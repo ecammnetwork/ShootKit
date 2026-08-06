@@ -47,6 +47,8 @@
 		AC82EA2B2A2A34B9006EE79D /* CameraSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC82EA292A2A33ED006EE79D /* CameraSource.swift */; };
 		AC82EA2F2A2A43D9006EE79D /* SampleBufferDisplayView.m in Sources */ = {isa = PBXBuildFile; fileRef = AC82EA2E2A2A43D9006EE79D /* SampleBufferDisplayView.m */; };
 		AC82EA372A2A5191006EE79D /* CameraSource.m in Sources */ = {isa = PBXBuildFile; fileRef = AC82EA362A2A5191006EE79D /* CameraSource.m */; };
+		AC8728F53023920A00BF35E5 /* CoreImageView.m in Sources */ = {isa = PBXBuildFile; fileRef = AC8728F43023920A00BF35E5 /* CoreImageView.m */; };
+		AC87292630247AD100BF35E5 /* CoreImageView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC87292530247AD100BF35E5 /* CoreImageView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -84,7 +86,7 @@
 		AC2956DC2A29E1BE00EC6CE7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		AC2956DF2A29E1BE00EC6CE7 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		AC2956E12A29E1BE00EC6CE7 /* Swift_Sample.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Swift_Sample.entitlements; sourceTree = "<group>"; };
-		AC74D45C2A2E116B0081D607 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; name = README.md; path = ../README.md; sourceTree = "<group>"; };
+		AC74D45C2A2E116B0081D607 /* README.md */ = {isa = PBXFileReference; explicitFileType = net.daringfireball.markdown; name = README.md; path = ../README.md; sourceTree = "<group>"; };
 		AC74D45D2A2E11860081D607 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
 		AC82E9BB2A29E33D006EE79D /* Objective-C Sample.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Objective-C Sample.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AC82E9BD2A29E33D006EE79D /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
@@ -128,6 +130,9 @@
 		AC82EA2E2A2A43D9006EE79D /* SampleBufferDisplayView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SampleBufferDisplayView.m; sourceTree = "<group>"; };
 		AC82EA352A2A5191006EE79D /* CameraSource.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CameraSource.h; sourceTree = "<group>"; };
 		AC82EA362A2A5191006EE79D /* CameraSource.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CameraSource.m; sourceTree = "<group>"; };
+		AC8728F3302391FB00BF35E5 /* CoreImageView.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CoreImageView.h; sourceTree = "<group>"; };
+		AC8728F43023920A00BF35E5 /* CoreImageView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CoreImageView.m; sourceTree = "<group>"; };
+		AC87292530247AD100BF35E5 /* CoreImageView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreImageView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -310,6 +315,7 @@
 			isa = PBXGroup;
 			children = (
 				AC82E9DB2A29E543006EE79D /* SampleBufferPlayer.swift */,
+				AC87292530247AD100BF35E5 /* CoreImageView.swift */,
 			);
 			path = Lib;
 			sourceTree = "<group>";
@@ -419,6 +425,8 @@
 				AC82EA2E2A2A43D9006EE79D /* SampleBufferDisplayView.m */,
 				AC82EA352A2A5191006EE79D /* CameraSource.h */,
 				AC82EA362A2A5191006EE79D /* CameraSource.m */,
+				AC8728F3302391FB00BF35E5 /* CoreImageView.h */,
+				AC8728F43023920A00BF35E5 /* CoreImageView.m */,
 			);
 			path = Lib;
 			sourceTree = "<group>";
@@ -635,6 +643,7 @@
 				AC82E9D92A29E495006EE79D /* MainNav.swift in Sources */,
 				AC82E9DC2A29E543006EE79D /* SampleBufferPlayer.swift in Sources */,
 				AC82E9D72A29E459006EE79D /* VideoPencilDemoView.swift in Sources */,
+				AC87292630247AD100BF35E5 /* CoreImageView.swift in Sources */,
 				AC82E9DE2A29E83F006EE79D /* ShootState.swift in Sources */,
 				AC82EA2B2A2A34B9006EE79D /* CameraSource.swift in Sources */,
 			);
@@ -647,6 +656,7 @@
 				AC82EA372A2A5191006EE79D /* CameraSource.m in Sources */,
 				AC82E9C22A29E33D006EE79D /* ViewController.m in Sources */,
 				AC82EA2F2A2A43D9006EE79D /* SampleBufferDisplayView.m in Sources */,
+				AC8728F53023920A00BF35E5 /* CoreImageView.m in Sources */,
 				AC82E9C92A29E33D006EE79D /* main.m in Sources */,
 				AC82E9BF2A29E33D006EE79D /* AppDelegate.m in Sources */,
 			);
@@ -979,7 +989,7 @@
 				INFOPLIST_FILE = "Sample Projects/Objective-C Sample/Objective-C-Sample-Info.plist";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Used to demo Video Pencil connection using your Mac's camera";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Required to discover and connect to devices running Shoot or Video Pencil";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Discovers Shoot cameras and Video Pencil on your local network.";
 				INFOPLIST_KEY_NSMainStoryboardFile = Main;
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -987,7 +997,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "goodtohear.shootkit.Objective-C-Sample";
+				PRODUCT_BUNDLE_IDENTIFIER = "goodtohear.shootkit.OBJC-Sample";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 			};
@@ -1009,7 +1019,7 @@
 				INFOPLIST_FILE = "Sample Projects/Objective-C Sample/Objective-C-Sample-Info.plist";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Used to demo Video Pencil connection using your Mac's camera";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Required to discover and connect to devices running Shoot or Video Pencil";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Discovers Shoot cameras and Video Pencil on your local network.";
 				INFOPLIST_KEY_NSMainStoryboardFile = Main;
 				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1017,7 +1027,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "goodtohear.shootkit.Objective-C-Sample";
+				PRODUCT_BUNDLE_IDENTIFIER = "goodtohear.shootkit.OBJC-Sample";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 			};

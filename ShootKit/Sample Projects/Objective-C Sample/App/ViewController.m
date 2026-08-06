@@ -8,6 +8,7 @@
 #import "ViewController.h"
 #import "Lib/SampleBufferDisplayView.h"
 #import "Lib/CameraSource.h"
+#import "Lib/CoreImageView.h"
 
 @import ShootKit;
 @import AVKit;
@@ -17,6 +18,7 @@
     CMSampleBufferRef latestVideoPencilBuffer;
     CMSampleBufferRef latestCameraBuffer;
     NSViewController * shootControlsViewController;
+    dispatch_queue_t videoPencilQueue;
 }
 
 @property(strong, nonatomic) ShootServer * shootServer;
@@ -31,7 +33,7 @@
 @property (weak) IBOutlet NSView *shootControlsContainer;
 
 @property (weak) IBOutlet SampleBufferDisplayView *cameraPreview;
-@property (weak) IBOutlet SampleBufferDisplayView *videoPencilLayerView;
+@property (weak) IBOutlet CoreImageView *videoPencilLayerView;
 @property (weak) IBOutlet NSTextField *videoPencilLabel;
 @property (weak) IBOutlet NSStackView *videoPencilStackView;
 @end
@@ -45,10 +47,28 @@
     [super viewDidLoad];
     shootCameras = [[NSMutableSet alloc] init];
     latestVideoPencilBuffer = nil;
+    videoPencilQueue = videoPencilQueue = dispatch_queue_create("Video Pencil Return",
+                                                                dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
     self.shootServer = [[ShootServer alloc] initWithName: @"Obj-C Demo" delegate: self];
-    self.videoPencilClient = [[VideoPencilClient alloc] initWithName: @"Obj-C Demo" delegate: self];
+    self.videoPencilClient = [[VideoPencilClient alloc] initWithName: @"Obj-C Demo" size: CGSizeMake(1920, 1080) delegate: self queue: videoPencilQueue ciContext:nil];
     
     [self startMacCamera];
+}
+
+#pragma mark - VideoPencilClientDelegate
+- (void)videoPencilDidConnect:(VideoPencilClient * _Nonnull)client {
+    self.videoPencilLabel.stringValue = @"Connected to Video Pencil";
+}
+
+-(void) videoPencilDidReceiveFrom:(VideoPencilClient *)from frame:(CIImage *)frame presentationTimeStamp:(CMTime)presentationTimeStamp presentationDuration:(CMTime)presentationDuration{
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.videoPencilLayerView.image = frame;
+    });
+}
+
+- (void)videoPencilDidDisconnect:(VideoPencilClient * _Nonnull)client {
+    self.videoPencilLabel.stringValue = @"Disconnected";
 }
 
 
@@ -94,46 +114,25 @@
 
 #pragma mark - Mac Camera
 -(void)captureOutput:(AVCaptureOutput *)output didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection{
-    latestCameraBuffer = (CMSampleBufferRef) CFRetain(sampleBuffer);
-    [self.videoPencilClient sendWithSampleBuffer: latestCameraBuffer];
-}
+    AVSampleBufferDisplayLayer * layer = self.cameraPreview.sampleBufferLayer;
+    if (layer.isReadyForMoreMediaData) {
+        [layer enqueueSampleBuffer:sampleBuffer];
+    }
 
-#pragma mark - VideoPencilClientDelegate
--(BOOL)videoPencilClientShouldCreateSampleBuffers{
-    return true;
-}
-- (void)videoPencilDidConnect:(VideoPencilClient * _Nonnull)client {
-    self.videoPencilLabel.stringValue = @"Connected to Video Pencil";
-    
-    // Supply Video Pencil transparent buffers to self.videoPencilLayerView which is on top of the camera preview
-    AVSampleBufferDisplayLayer* layer = self.videoPencilLayerView.sampleBufferLayer;
-    [layer requestMediaDataWhenReadyOnQueue:dispatch_get_main_queue() usingBlock:^{
-        if(layer.isReadyForMoreMediaData && self->latestVideoPencilBuffer != nil){
-            [layer enqueueSampleBuffer: self->latestVideoPencilBuffer];
-        }
-    }];
-}
-
-- (void)videoPencilDidDisconnect:(VideoPencilClient * _Nonnull)client {
-    self.videoPencilLabel.stringValue = @"Disconnected";
+    CIImage* frame = [[CIImage alloc] initWithCVPixelBuffer:CMSampleBufferGetImageBuffer(sampleBuffer)];
+    NSError * error;
+    [self.videoPencilClient sendFrame:frame presentationTimeStamp: CMClockGetTime(CMClockGetHostTimeClock()) presentationDuration:CMTimeMake(1, 30) error:&error];
 }
 
 
-- (void)videoPencilDidReceiveFrom:(VideoPencilClient * _Nonnull)from sampleBuffer:(CMSampleBufferRef _Nonnull)sampleBuffer {
-    latestVideoPencilBuffer = (CMSampleBufferRef) CFRetain(sampleBuffer);
-}
 
 #pragma mark - Demo-specific
 
 -(void)startMacCamera{
     
     self.cameraSource = [[CameraSource alloc] initWithCaptureDelegate:self];
-    AVSampleBufferDisplayLayer * layer = self.cameraPreview.sampleBufferLayer;
-    [layer requestMediaDataWhenReadyOnQueue:dispatch_get_main_queue() usingBlock:^{
-        if(layer.isReadyForMoreMediaData && self->latestCameraBuffer != nil){
-            [layer enqueueSampleBuffer: self->latestCameraBuffer];
-        }
-    }];
+    [self.cameraSource selectCameraNamed: @"FaceTime HD Camera"];
+   
     
 }
 

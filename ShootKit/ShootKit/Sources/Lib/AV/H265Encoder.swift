@@ -33,18 +33,19 @@ class H265Encoder {
     }
     
     private var encodeQueue = DispatchQueue(label: "encode")
-    private var callBackQueue = DispatchQueue(label: "callBack")
+    private var callBackQueue: DispatchQueue
     
     var encodeSession:VTCompressionSession?
     var encodeCallBack:VTCompressionOutputCallback?
     var codecType: CMVideoCodecType
     
-    init(codecType: CMVideoCodecType = kCMVideoCodecType_HEVC, width:Int32, height:Int32, bitRate : Int32?, fps: Int32?) {
+    init(codecType: CMVideoCodecType = kCMVideoCodecType_HEVC, width:Int32, height:Int32, bitRate : Int32?, fps: Int32?, callbackQueue: DispatchQueue) {
         self.codecType = codecType
         self.width = width
         self.height = height
         self.bitRate = bitRate != nil ? bitRate! : height * 3 * 4
         self.fps = (fps != nil) ? fps! : 30
+        self.callBackQueue = callbackQueue
         delegate?.log(message:"Encoder configuration size: \(self.width)x\(self.height) bitRate: \(self.bitRate) fps: \(self.fps)", color: .systemGreen)
         setCallBack()
         initVideoToolBox()
@@ -116,9 +117,8 @@ class H265Encoder {
         encodeCallBack = {(outputCallbackRefCon, sourceFrameRefCon, status, flag, sampleBuffer)  in
             guard let outputCallbackRefCon = outputCallbackRefCon else {return}
             let encoder : H265Encoder =
-//                unsafeBitCast(outputCallbackRefCon, to: H265Encoder.self)
                  Unmanaged<H265Encoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
-            let callBackQueue = encoder.callBackQueue // cos we were hitting EXC_BAD_ACCESS?
+            let callBackQueue = encoder.callBackQueue
             
             guard let sampleBuffer = sampleBuffer else {
                 return
@@ -130,11 +130,9 @@ class H265Encoder {
             /// 1. [UInt8] -> UnsafeBufferPointer<UInt8>
 
             
-            let attachArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
-
-            let strkey = unsafeBitCast(kCMSampleAttachmentKey_NotSync, to: UnsafeRawPointer.self)
-            let cfDic = unsafeBitCast(CFArrayGetValueAtIndex(attachArray, 0), to: CFDictionary.self)
-            let keyFrame = !CFDictionaryContainsKey(cfDic, strkey)//Without this key, it means synchronization, which is a key frame
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
+            let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
+            let keyFrame = !notSync // absent or false means this is a sync (key) frame
             
             //  Obtain sps pps
             if keyFrame && encoder.parameterSet == nil{
@@ -190,7 +188,6 @@ class H265Encoder {
         }
         encodeQueue.async {[weak self] in
             guard let self = self, var imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let encodeSession = self.encodeSession else { return }
-            imageBuffer = Unmanaged<CVImageBuffer>.passRetained(imageBuffer).takeRetainedValue()
 //        encodeQueue.async {
 //            guard var imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let encodeSession = self.encodeSession else { return }
 //            imageBuffer = Unmanaged<CVImageBuffer>.passUnretained(imageBuffer).takeRetainedValue()

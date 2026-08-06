@@ -5,10 +5,51 @@ By Michael Forrest
 ShootKit lets you add [Shoot](https://squares.tv/shoot) and [Video Pencil](https://squares.tv/videopencil) support to your MacOS applications.
 
 ## Features 
-* Video feed from Shoot - just implement a delegate to handle the `CMSampleBuffer` stream
+* Integrate Video Pencil 
+* Video feed from Shoot Pro Camera Source app
 * Enumerate and switch Shoot's camera sources 
 * Shoot control panel using SwiftUI (use NSHostingController to add to your non-SwiftUI or Objective-C project)
-* Bi-directional Video Pencil feeds - send a reference layer to Video Pencil and receive a transparent overlay back
+
+## VideoPencilClient
+The [Video Pencil](https://videopencil.com?ct=ShootKit) client lets you:
+1. Send a video feed to the iPad
+2. Receive a transparent video overlay
+
+### Objective-C
+```objectivec
+// Create VideoPencilClient
+self.videoPencilClient =  [
+    [VideoPencilClient alloc] initWithName: @"My Video App"
+                                      size: CGSizeMake(1920, 1080)
+                                  delegate: self
+                                     queue: self.callbackQueue
+                                 ciContext: nil
+    ];
+
+// Send video frame to iPad:
+[self.videoPencilClient sendFrame: ciImage presentationTimeStamp: time presentationDuration: duration];
+
+// Receive drawing frames as `VideoPencilClientDelegate`
+- (void)videoPencilDidReceiveFrom:(VideoPencilClient * _Nonnull)from frame:(CIImage _Nonnull)frame presentationTimeStamp:(CMTime) presentationDuration:(CMTime)presentationDuration{
+    // use `frame` in your CoreImage pipeline
+}
+
+```
+
+
+### Swift
+```swift
+// Create VideoPencilClient
+let client = VideoPencilClient(name: "My Video App", delegate: self, queue: callbackQueue, ciContext: nil)
+
+// Send video frame to iPad
+client.send(frame: ciImage, presentationTimeStamp: time, presentationDuration: duration)
+
+// Receive drawing frames as `VideoPencilClientDelegate`
+func videoPencilDidReceive(from: VideoPencilClient, frame: CIImage, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
+      // use `frame` in your CoreImage pipeline 
+}
+```
 
 ## Get started
 Check the sample projects 

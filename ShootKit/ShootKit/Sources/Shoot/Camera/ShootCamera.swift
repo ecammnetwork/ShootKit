@@ -160,8 +160,7 @@ import VideoToolbox
             decoder = nil
         }
         
-        decoder = H265Decoder()
-        decoder?.setConfig(width: 1920, height: 1080)
+        decoder = H265Decoder(width: 1920, height: 1080, callbackQueue: queue)
         decoder?.delegate = self
         
     }

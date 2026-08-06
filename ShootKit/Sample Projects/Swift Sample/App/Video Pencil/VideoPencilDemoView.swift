@@ -7,6 +7,8 @@
 
 import SwiftUI
 import AVKit
+import MetalKit
+import CoreImage
 
 struct VideoPencilDemoView: View {
     @StateObject var state = VideoPencilState()
@@ -14,18 +16,18 @@ struct VideoPencilDemoView: View {
     var body: some View {
         VStack {
             ZStack {
-                SampleBufferPlayer(sampleBufferSource: state.cameraBuffers)
+                CoreImageView(state: state)
                 
-                if state.videoPencilClient.hasConnection{
-                    SampleBufferPlayer(sampleBufferSource: state.videoPencilBuffers)
-                }else{
+                if state.videoPencilClient?.hasConnection != true{
                     awaitingConnection
                 }
             }
             if state.isConnected{
                 Text("Connected to Video Pencil")
             }
-            CameraPicker(cameraSource: state.cameraSource)
+            if let cameraSource = state.cameraSource{
+                CameraPicker(cameraSource: cameraSource)
+            }
         }
         .padding()
     }
@@ -55,6 +57,8 @@ struct CameraPicker: View{
         }
     }
 }
+
+
 
 struct VideoPencilDemoView_Previews: PreviewProvider {
     static var previews: some View {
