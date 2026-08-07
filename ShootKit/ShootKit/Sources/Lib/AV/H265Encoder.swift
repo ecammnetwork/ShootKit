@@ -9,7 +9,7 @@ import Foundation
 import VideoToolbox
 
 protocol H265EncoderDelegate:AnyObject, ConnectionLogger {
-    func videoEncoderDidYieldVideoData(_ encoder : H265Encoder, compressedVideo : Data, isKeyFrame: Bool)
+    func videoEncoderDidYieldVideoData(_ encoder : H265Encoder, compressedVideo : Data)
     func videoEncoderDidExtractParameterSet(_ encoder : H265Encoder, parameterSet: [Data])
     func videoEncoderDidEncodeSampleBuffer(_ encoder: H265Encoder, sampleBuffer: CMSampleBuffer)
     func videoEncoderDidFail(_ encoder: H265Encoder, error: OSStatus)
@@ -53,7 +53,6 @@ class H265Encoder {
     private var frameInFlight = false
     private var invalidated = false
     private var extractedParameterSet = false
-    private var forceNextKeyFrame = false
 
     // Ecamm: Callers use this after construction to avoid accepting frames when
     // VideoToolbox could not allocate the required hardware encoder.
@@ -217,7 +216,7 @@ class H265Encoder {
         let data = Data(bytes: dataPointer, count: totalLength)
         callBackQueue.async { [weak self] in
             guard let self = self else { return }
-            self.delegate?.videoEncoderDidYieldVideoData(self, compressedVideo: data, isKeyFrame: keyFrame)
+            self.delegate?.videoEncoderDidYieldVideoData(self, compressedVideo: data)
             self.addToTotal(bytes: data.count)
         }
     }
@@ -263,16 +262,6 @@ class H265Encoder {
         submitPendingFrameIfPossible()
     }
 
-    func requestKeyFrame() {
-        // Ecamm: Network backpressure can discard an encoded prediction chain.
-        // Force the next submitted frame to be independently decodable so the
-        // bounded sender can recover without reconnecting.
-        encodeQueue.async { [weak self] in
-            guard let self = self, !self.invalidated else { return }
-            self.forceNextKeyFrame = true
-        }
-    }
-
     private func submitPendingFrameIfPossible() {
         guard !invalidated,
               !frameInFlight,
@@ -295,19 +284,13 @@ class H265Encoder {
         pendingFrame = nil
         frameInFlight = true
         var flags = VTEncodeInfoFlags()
-        let frameProperties = forceNextKeyFrame
-            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
-            : nil
         let state = VTCompressionSessionEncodeFrame(encodeSession,
                                                     imageBuffer: frame.pixelBuffer,
                                                     presentationTimeStamp: frame.presentationTimeStamp,
                                                     duration: frame.duration,
-                                                    frameProperties: frameProperties,
+                                                    frameProperties: nil,
                                                     sourceFrameRefcon: nil,
                                                     infoFlagsOut: &flags)
-        if state == noErr && forceNextKeyFrame {
-            forceNextKeyFrame = false
-        }
         if state != noErr {
             frameInFlight = false
             callBackQueue.async { [weak self] in

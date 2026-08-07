@@ -35,9 +35,9 @@ so they are easy to review and upstream independently.
   The decoder instead preserves compressed-frame order in a bounded 12-frame,
   32 MB queue with up to four VideoToolbox submissions in flight; compressed
   HEVC prediction frames are never replaced with newer frames.
-- The network sender permits one send in flight and one waiting compressed frame.
-  On overflow it discards prediction frames and forces a new keyframe, keeping
-  slow Wi-Fi bounded without sending a broken HEVC reference chain.
+- The network sender preserves compressed-frame order in a bounded 60-frame,
+  32 MB FIFO and permits four ordered Network.framework sends in flight. A true
+  overflow pauses production and restarts the encoder at a clean keyframe.
 - ShootKit requires a hardware HEVC encoder and does not repeatedly create a
   failed encoder from the host render loop.
 

@@ -31,16 +31,14 @@ import CoreImage
         let presentationDuration: CMTime
     }
 
-    private struct PendingEncodedFrame {
-        let data: Data
-        let isKeyFrame: Bool
-    }
-
     // Ecamm: Video Pencil's transport and drawing coordinates use one predictable
     // 16:9 raster. Non-16:9 host video is aspect-fitted into this canvas.
     private static let encodedFrameSize = CGSize(width: 1920, height: 1080)
     private static let maximumSourceFramesPerSecond = 30.0
     private static let pixelBufferPoolCapacity = 3
+    private static let maximumQueuedEncodedFrames = 60
+    private static let maximumQueuedEncodedBytes = 32 * 1024 * 1024
+    private static let maximumVideoSendsInFlight = 4
 
     public var logger = BaseConnectionLogger()
 
@@ -94,10 +92,11 @@ import CoreImage
     private var didNotifyConnected = false
     private var reconnectScheduled = false
     private var reconnectGeneration = 0
-    private var videoSendInFlight = false
-    private var pendingEncodedVideoFrame: PendingEncodedFrame?
+    private var encodedVideoQueue = [Data]()
+    private var encodedVideoQueueBytes = 0
+    private var videoSendsInFlight = 0
     private var hasSentParameterSet = false
-    private var waitingForEncodedKeyFrame = false
+    private var restartVideoStreamWhenSendsComplete = false
     private var videoStreamGeneration = 0
 
     let bonjourBrowser = ShootKit.nwBrowser(for: .videoPencilApp)
@@ -299,9 +298,10 @@ import CoreImage
     private func startVideoStream() {
         cancelVideoStream()
         hasSentParameterSet = false
-        pendingEncodedVideoFrame = nil
-        videoSendInFlight = false
-        waitingForEncodedKeyFrame = false
+        encodedVideoQueue.removeAll()
+        encodedVideoQueueBytes = 0
+        videoSendsInFlight = 0
+        restartVideoStreamWhenSendsComplete = false
 
         let targetSize = Self.encodedFrameSize
         let newEncoder = H265Encoder(width: Int32(targetSize.width),
@@ -332,10 +332,11 @@ import CoreImage
         setFrameStreamingEnabled(false)
         encoder?.invalidate()
         encoder = nil
-        pendingEncodedVideoFrame = nil
-        videoSendInFlight = false
+        encodedVideoQueue.removeAll()
+        encodedVideoQueueBytes = 0
+        videoSendsInFlight = 0
         hasSentParameterSet = false
-        waitingForEncodedKeyFrame = false
+        restartVideoStreamWhenSendsComplete = false
     }
 
     private func send<T>(basicMessage: BasicControlMessage<T>) {
@@ -700,86 +701,82 @@ extension VideoPencilClient: H265EncoderDelegate {
                     self.log(message: "Error sending encoder parameters " + error.debugDescription, color: .red)
                 } else {
                     self.hasSentParameterSet = true
-                    // Ecamm: Frames encoded while the parameter-set send was in
-                    // flight may depend on frames intentionally discarded during
-                    // that wait. Keep the original keyframe, then force a fresh
-                    // prediction chain for all subsequent video.
-                    if self.pendingEncodedVideoFrame?.isKeyFrame == false {
-                        self.pendingEncodedVideoFrame = nil
-                    }
-                    self.waitingForEncodedKeyFrame = true
-                    self.encoder?.requestKeyFrame()
-                    self.sendNextEncodedVideoData()
+                    // Ecamm: The bounded FIFO retains frames encoded while the
+                    // parameter set is in flight, so the complete prediction chain
+                    // can begin sending as soon as the parameter set is accepted.
+                    self.sendQueuedEncodedVideoData()
                 }
             }
         }))
     }
 
-    func videoEncoderDidYieldVideoData(_ encoder: H265Encoder,
-                                      compressedVideo data: Data,
-                                      isKeyFrame: Bool) {
+    func videoEncoderDidYieldVideoData(_ encoder: H265Encoder, compressedVideo data: Data) {
         guard encoder === self.encoder, !data.isEmpty else { return }
-        let frame = PendingEncodedFrame(data: data, isKeyFrame: isKeyFrame)
 
-        // Ecamm: Preserve the first keyframe while its parameter set is being
-        // acknowledged. Later prediction frames cannot be sent safely if any
-        // predecessor was discarded during that wait.
-        guard hasSentParameterSet else {
-            if pendingEncodedVideoFrame == nil || isKeyFrame {
-                pendingEncodedVideoFrame = frame
-            }
+        guard !restartVideoStreamWhenSendsComplete else { return }
+        let wouldOverflow = data.count > Self.maximumQueuedEncodedBytes ||
+            encodedVideoQueue.count >= Self.maximumQueuedEncodedFrames ||
+            encodedVideoQueueBytes > Self.maximumQueuedEncodedBytes - data.count
+        if wouldOverflow {
+            // Ecamm: Stop producing frames and restart with a clean encoder after
+            // already-submitted sends finish. This is exceptional backpressure;
+            // ordinary NWConnection latency is absorbed by the bounded FIFO.
+            restartVideoStreamWhenSendsComplete = true
+            setFrameStreamingEnabled(false)
+            encodedVideoQueue.removeAll()
+            encodedVideoQueueBytes = 0
+            log(message: "Video sender queue overflowed; restarting the stream", color: .orange)
+            restartVideoStreamAfterBackpressureIfPossible()
             return
         }
 
-        if waitingForEncodedKeyFrame {
-            guard isKeyFrame else { return }
-            waitingForEncodedKeyFrame = false
-            pendingEncodedVideoFrame = frame
-            sendNextEncodedVideoData()
-            return
-        }
-
-        if pendingEncodedVideoFrame != nil {
-            // Ecamm: The one-frame waiting slot is full. Dropping arbitrary HEVC
-            // prediction frames would corrupt the receiver's reference chain, so
-            // discard until a newly forced keyframe can replace the waiting frame.
-            waitingForEncodedKeyFrame = true
-            encoder.requestKeyFrame()
-            log(message: "Video sender fell behind; resynchronizing at a keyframe", color: .orange)
-            return
-        }
-
-        pendingEncodedVideoFrame = frame
-        sendNextEncodedVideoData()
+        encodedVideoQueue.append(data)
+        encodedVideoQueueBytes += data.count
+        sendQueuedEncodedVideoData()
     }
 
-    private func sendNextEncodedVideoData() {
+    private func sendQueuedEncodedVideoData() {
         guard hasSentParameterSet,
-              !videoSendInFlight,
-              let frame = pendingEncodedVideoFrame,
               let connection = connection,
               connection.state == .ready
         else { return }
 
-        pendingEncodedVideoFrame = nil
-        videoSendInFlight = true
-        let generation = videoStreamGeneration
-        let message = NWProtocolFramer.Message(videoMessageType: .videoFrame)
-        let context = NWConnection.ContentContext(identifier: "videoFrame", metadata: [message])
-        connection.send(content: frame.data, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self, weak connection] error in
-            guard let self = self else { return }
-            self.queue.async {
-                guard let connection = connection,
-                      connection === self.connection,
-                      generation == self.videoStreamGeneration
-                else { return }
-                self.videoSendInFlight = false
-                if let error = error {
-                    self.log(message: "Error sending encoded video: " + error.debugDescription, color: .red)
+        // Ecamm: NWConnection preserves send order. Several sends may be active
+        // so normal completion latency does not look like network backpressure.
+        while videoSendsInFlight < Self.maximumVideoSendsInFlight,
+              !encodedVideoQueue.isEmpty {
+            let data = encodedVideoQueue.removeFirst()
+            encodedVideoQueueBytes -= data.count
+            videoSendsInFlight += 1
+            let generation = videoStreamGeneration
+            let message = NWProtocolFramer.Message(videoMessageType: .videoFrame)
+            let context = NWConnection.ContentContext(identifier: "videoFrame", metadata: [message])
+            connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self, weak connection] error in
+                guard let self = self else { return }
+                self.queue.async {
+                    guard let connection = connection,
+                          connection === self.connection,
+                          generation == self.videoStreamGeneration
+                    else { return }
+                    self.videoSendsInFlight = max(0, self.videoSendsInFlight - 1)
+                    if let error = error {
+                        self.log(message: "Error sending encoded video: " + error.debugDescription, color: .red)
+                        self.stopConnection(notifyDelegate: true)
+                        self.scheduleReconnect()
+                        return
+                    }
+                    self.sendQueuedEncodedVideoData()
+                    self.restartVideoStreamAfterBackpressureIfPossible()
                 }
-                self.sendNextEncodedVideoData()
-            }
-        }))
+            }))
+        }
+    }
+
+    private func restartVideoStreamAfterBackpressureIfPossible() {
+        guard restartVideoStreamWhenSendsComplete, videoSendsInFlight == 0 else { return }
+        // Ecamm: Recreating the encoder guarantees the next outbound prediction
+        // chain starts with a parameter set and keyframe after an overflow.
+        startVideoStream()
     }
 
     func videoEncoderDidEncodeSampleBuffer(_ encoder: H265Encoder, sampleBuffer: CMSampleBuffer) {
