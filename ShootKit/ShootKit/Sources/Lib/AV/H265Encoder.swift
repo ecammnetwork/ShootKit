@@ -16,6 +16,10 @@ protocol H265EncoderDelegate:AnyObject, ConnectionLogger {
 }
 
 class H265Encoder {
+    // Ecamm: VideoToolbox is asynchronous and needs a small pipeline to sustain
+    // real-time frame rates without allowing an unbounded number of submissions.
+    private static let maximumFramesInFlight = 4
+
     private struct PendingFrame {
         let pixelBuffer: CVPixelBuffer
         let presentationTimeStamp: CMTime
@@ -50,7 +54,7 @@ class H265Encoder {
     private var pendingSubmission: PendingFrame?
     private var submissionScheduled = false
     private var acceptingFrames = true
-    private var frameInFlight = false
+    private var framesInFlight = 0
     private var invalidated = false
     private var extractedParameterSet = false
 
@@ -166,12 +170,13 @@ class H265Encoder {
     }
 
     private func handleCompressionOutput(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
-        // Ecamm: Every submitted frame must release the one-in-flight slot, even
+        // Ecamm: Every submitted frame must release its bounded pipeline slot, even
         // when VideoToolbox returns an error or no sample buffer.
         defer {
             encodeQueue.async { [weak self] in
-                self?.frameInFlight = false
-                self?.submitPendingFrameIfPossible()
+                guard let self = self else { return }
+                self.framesInFlight = max(0, self.framesInFlight - 1)
+                self.submitPendingFrameIfPossible()
             }
         }
 
@@ -264,7 +269,7 @@ class H265Encoder {
 
     private func submitPendingFrameIfPossible() {
         guard !invalidated,
-              !frameInFlight,
+              framesInFlight < Self.maximumFramesInFlight,
               let encodeSession = encodeSession,
               let frame = pendingFrame
         else { return }
@@ -282,7 +287,7 @@ class H265Encoder {
         }
 
         pendingFrame = nil
-        frameInFlight = true
+        framesInFlight += 1
         var flags = VTEncodeInfoFlags()
         let state = VTCompressionSessionEncodeFrame(encodeSession,
                                                     imageBuffer: frame.pixelBuffer,
@@ -292,12 +297,17 @@ class H265Encoder {
                                                     sourceFrameRefcon: nil,
                                                     infoFlagsOut: &flags)
         if state != noErr {
-            frameInFlight = false
+            framesInFlight -= 1
             callBackQueue.async { [weak self] in
                 guard let self = self else { return }
                 self.delegate?.log(message: "encode failure \(OSErrorCodeDescription(state))", color: .red)
                 self.delegate?.videoEncoderDidFail(self, error: state)
             }
+            submitPendingFrameIfPossible()
+        } else if flags.contains(.frameDropped) {
+            // Ecamm: A synchronously dropped frame has no output callback, so it
+            // must release its slot here or the encoder pipeline eventually stalls.
+            framesInFlight -= 1
             submitPendingFrameIfPossible()
         }
     }
@@ -314,7 +324,7 @@ class H265Encoder {
             guard !invalidated else { return }
             invalidated = true
             pendingFrame = nil
-            frameInFlight = false
+            framesInFlight = 0
             if let encodeSession = encodeSession {
                 VTCompressionSessionInvalidate(encodeSession)
                 self.encodeSession = nil

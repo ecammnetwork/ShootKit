@@ -17,9 +17,9 @@ protocol H265DecoderDelegate:AnyObject, ConnectionLogger{
 class H265Decoder {
     // Ecamm: Preserve compressed HEVC ordering while keeping a firm memory bound.
     // Prediction frames cannot be replaced with a newer frame like raw video can.
-    private static let maximumQueuedFrames = 12
+    private static let maximumQueuedFrames = 60
     private static let maximumQueuedBytes = 32 * 1024 * 1024
-    private static let maximumFramesInFlight = 4
+    private static let maximumFramesInFlight = 8
 
     weak var delegate : H265DecoderDelegate?
     var expectsNalu: Bool = true
@@ -324,21 +324,26 @@ class H265Decoder {
         while framesInFlight < Self.maximumFramesInFlight,
               let data = nextQueuedSubmission() {
             framesInFlight += 1
-            let decodeState = decode(frame: data)
-            if decodeState != noErr {
+            let decodeResult = decode(frame: data)
+            if decodeResult.status != noErr {
                 // A synchronous rejection does not produce a callback, so release
                 // its slot here and let the client restart the damaged stream.
                 framesInFlight -= 1
                 callBackQueue.async { [weak self] in
                     guard let self = self else { return }
-                    self.delegate?.videoDecoder(self, failedWith: decodeState)
+                    self.delegate?.videoDecoder(self, failedWith: decodeResult.status)
                 }
                 return
+            } else if decodeResult.frameDropped {
+                // Ecamm: VideoToolbox reports synchronous drops without calling
+                // the output callback. Release the slot immediately so eight such
+                // drops cannot permanently stop all future decoding.
+                framesInFlight -= 1
             }
         }
     }
     
-    private func decode(frame:Data) -> OSStatus {
+    private func decode(frame:Data) -> (status: OSStatus, frameDropped: Bool) {
         //
         var blockBuffer: CMBlockBuffer?
         let size = frame.count
@@ -370,10 +375,10 @@ class H265Decoder {
                                                             blockBufferOut: &blockBuffer)
         if blockState != noErr {
             self.delegate?.log(message: "Failed to create blockBuffer \(OSErrorCodeDescription(blockState))", color: .red)
-            return blockState
+            return (blockState, false)
         }
         guard let blockBuffer = blockBuffer else {
-            return kCMBlockBufferBadCustomBlockSourceErr
+            return (kCMBlockBufferBadCustomBlockSourceErr, false)
         }
         let copyState = frame.withUnsafeBytes { bytes -> OSStatus in
             guard let baseAddress = bytes.baseAddress else { return kCMBlockBufferBadLengthParameterErr }
@@ -381,7 +386,7 @@ class H265Decoder {
         }
         if copyState != noErr {
             self.delegate?.log(message: "Failed to copy HEVC data into blockBuffer \(OSErrorCodeDescription(copyState))", color: .red)
-            return copyState
+            return (copyState, false)
         }
         //
         var sampleSizeArray :[Int] = [Int(size)]
@@ -409,10 +414,10 @@ class H265Decoder {
                                                    sampleBufferOut: &sampleBuffer)
         if readyState != noErr {
             self.delegate?.log(message: "Sample Buffer Create Ready failed \(OSErrorCodeDescription(readyState))", color: .red)
-            return readyState
+            return (readyState, false)
         }
         
-        guard let decompressionSession = self.decompressionSession, let sampleBuffer = sampleBuffer else { return kVTInvalidSessionErr }
+        guard let decompressionSession = self.decompressionSession, let sampleBuffer = sampleBuffer else { return (kVTInvalidSessionErr, false) }
 
         // Ecamm: Set display-immediately before submitting the sample; changing
         // attachments after an asynchronous decode has begun is a data race.
@@ -432,13 +437,13 @@ class H265Decoder {
          Parameter 5: Synchronous/asynchronous decoding identification
          */
         let sourceFrame:UnsafeMutableRawPointer? = nil
-        var inforFalg = VTDecodeInfoFlags.asynchronous
+        var infoFlags = VTDecodeInfoFlags()
         let decodeState = VTDecompressionSessionDecodeFrame(
             decompressionSession,
             sampleBuffer: sampleBuffer,
             flags: VTDecodeFrameFlags._EnableAsynchronousDecompression,
             frameRefcon: sourceFrame,
-            infoFlagsOut: &inforFalg
+            infoFlagsOut: &infoFlags
         )
         if decodeState != noErr {
             delegate?.log(message: "Decoding failed for \(decompressionSession) \(OSErrorCodeDescription(decodeState))", color: .red)
@@ -449,7 +454,7 @@ class H265Decoder {
 //            self.numberOfFramesBeingDecoded = numberOfFramesBeingDecoded
         }
 
-        return decodeState
+        return (decodeState, infoFlags.contains(.frameDropped))
     }
 
     func invalidate() {

@@ -35,7 +35,7 @@ import CoreImage
     // 16:9 raster. Non-16:9 host video is aspect-fitted into this canvas.
     private static let encodedFrameSize = CGSize(width: 1920, height: 1080)
     private static let maximumSourceFramesPerSecond = 30.0
-    private static let pixelBufferPoolCapacity = 3
+    private static let pixelBufferPoolCapacity = 6
     private static let maximumQueuedEncodedFrames = 60
     private static let maximumQueuedEncodedBytes = 32 * 1024 * 1024
     private static let maximumVideoSendsInFlight = 4

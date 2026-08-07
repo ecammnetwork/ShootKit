@@ -29,11 +29,12 @@ so they are easy to review and upstream independently.
 - Source-frame preparation runs on a dedicated queue and is capped at 30 fps.
 - Every source shape is aspect-fitted into a black 1920x1080 canvas. Tall and
   narrow sources are pillarboxed; extra-wide sources are letterboxed.
-- A three-buffer `CVPixelBufferPool` bounds prepared-frame memory. Pool
+- A six-buffer `CVPixelBufferPool` bounds prepared-frame memory. Pool
   exhaustion drops a frame instead of allocating without limit.
-- The HEVC encoder keeps one frame in flight and one newest raw frame waiting.
-  The decoder instead preserves compressed-frame order in a bounded 12-frame,
-  32 MB queue with up to four VideoToolbox submissions in flight; compressed
+- The HEVC encoder allows four asynchronous frames in flight and keeps one newest
+  raw frame waiting. Synchronous VideoToolbox drops release their slots directly.
+  The decoder instead preserves compressed-frame order in a bounded 60-frame,
+  32 MB queue with up to eight VideoToolbox submissions in flight; compressed
   HEVC prediction frames are never replaced with newer frames.
 - The network sender preserves compressed-frame order in a bounded 60-frame,
   32 MB FIFO and permits four ordered Network.framework sends in flight. A true
