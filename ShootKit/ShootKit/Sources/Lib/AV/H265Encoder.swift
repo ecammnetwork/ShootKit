@@ -73,16 +73,10 @@ class H265Encoder {
     
     @discardableResult
     private func initVideoToolBox() -> Bool {
-        // Ecamm: The old code checked hardware *decoding* support, which says
-        // nothing about whether a real-time hardware encoder is available.
-        let hevcSupported = VTIsHardwareEncodeSupported(kCMVideoCodecType_HEVC)
-        if !hevcSupported {
-            delegate?.log(message: "HEVC hardware encoding not supported on this device", color: .systemRed)
-            return false
-        }
-
         // Ecamm: Video Pencil must never silently fall back to a software encoder
         // and consume the CPU needed by the host application's primary encoders.
+        // VideoToolbox has no encode equivalent of VTIsHardwareDecodeSupported;
+        // requiring hardware here makes session creation itself the availability check.
         let encoderSpecification = [
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true
         ] as CFDictionary
