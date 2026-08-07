@@ -23,20 +23,21 @@ class H265Decoder {
     var decodeQueue = DispatchQueue(label: "decode") // both serial queues
     var callBackQueue:DispatchQueue
     var decodeDesc : CMVideoFormatDescription?
+    private let submissionLock = NSLock()
     
-    var parameterSet: [Data]?{
-        didSet{
-            DispatchQueue.main.async {
-                self.parameterSetView = self.parameterSet
-            }
-        }
-    }
+    private var parameterSet: [Data]?
     @Published var parameterSetView: [Data]?
 
     @Published var totalBytesDecoded: Int = 0
     
     var decompressionSession : VTDecompressionSession?
     var callback : VTDecompressionOutputCallback?
+    private var pendingFrame: Data?
+    private var pendingSubmission: Data?
+    private var submissionScheduled = false
+    private var acceptingFrames = true
+    private var frameInFlight = false
+    private var invalidated = false
     
     var pixelBufferPool: CVPixelBufferPool?
     private var outputBufferAuxAttributes: NSDictionary?
@@ -47,6 +48,20 @@ class H265Decoder {
         self.width = width
         self.height = height
         self.callBackQueue = callbackQueue
+    }
+
+    func setParameterSet(_ newParameterSet: [Data]) {
+        // Ecamm: Parameter sets arrive on a connection queue while decoding runs
+        // on decodeQueue. Serialize the handoff so the decoder never reads an
+        // Array concurrently with its replacement.
+        decodeQueue.async { [weak self] in
+            guard let self = self, !self.invalidated else { return }
+            self.parameterSet = newParameterSet
+            DispatchQueue.main.async { [weak self] in
+                self?.parameterSetView = newParameterSet
+            }
+            self.submitPendingFrameIfPossible()
+        }
     }
     
     func initDecoder() -> Bool {
@@ -63,18 +78,24 @@ class H265Decoder {
         //frameData.append(point + UnsafePointer<UInt8>.Stride(4), count: Int(naluSize))
         //Processing sps/pps
         
-        let parameterValues = parameterSet.map { data in
-            var result = [UInt8]()
-            [UInt8](data).suffix(from: 4).forEach { (value) in
-                result.append(value)
-            }
-            return result
+        // Ecamm: Each HEVC parameter set starts with a four-byte Annex B start
+        // code. Validate that assumption before slicing so malformed network data
+        // cannot trap in suffix(from:).
+        guard !parameterSet.isEmpty,
+              parameterSet.count <= 8,
+              parameterSet.allSatisfy({ $0.count > 4 }),
+              parameterSet.reduce(0, { $0 + $1.count }) <= 64 * 1024
+        else {
+            delegate?.log(message: "Rejected invalid HEVC parameter set", color: .red)
+            return false
         }
 
-        
-        let parameterSetPointers = parameterValues.compactMap { $0.withUnsafeBufferPointer{$0}.baseAddress}
-        
-        let sizes = parameterValues.map{$0.count}
+        // Ecamm: NSData owns stable storage for the duration of the Core Media
+        // call. The old pointers escaped withUnsafeBufferPointer closures, whose
+        // lifetime ended before CMVideoFormatDescription used them.
+        let parameterValues = parameterSet.map { NSData(data: Data($0.dropFirst(4))) }
+        let parameterSetPointers = parameterValues.map { $0.bytes.assumingMemoryBound(to: UInt8.self) }
+        let sizes = parameterValues.map { $0.length }
         
         /**
          Set decoding parameters according to sps pps
@@ -179,6 +200,15 @@ class H265Decoder {
                 //unsafeBitCast(decompressionOutputRefCon, to: H265Decoder.self)
              Unmanaged<H265Decoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
 
+            // Ecamm: Release the in-flight slot on every callback path, including
+            // decoder errors that do not contain an image buffer.
+            defer {
+                decoder.decodeQueue.async {
+                    decoder.frameInFlight = false
+                    decoder.submitPendingFrameIfPossible()
+                }
+            }
+
             if let delegate = decoder.delegate  {
 
                 if inforFlags.contains(.frameDropped){
@@ -198,26 +228,68 @@ class H265Decoder {
         }
     }
     func decode(_ data: Data) {
-        decodeQueue.async {[weak self] in
-            guard let self = self else { return }
-            let length:UInt32 =  UInt32(data.count)
-//            self.delegate?.log(message: "will decode \(data)")
-            self.decodeByte(data: data, size: length)
-        }
-    }
-    private func decodeByte(data:Data,size:UInt32) {
-        if parameterSet == nil {
+        // Ecamm: Bound compressed-frame memory independently of the network
+        // framer because H265Decoder is also used by ShootCamera.
+        guard data.count <= VideoProtocol.maximumMessageLength else {
+            delegate?.log(message: "Rejected oversized HEVC frame", color: .red)
             return
         }
-        if initDecoder(){
-            decode(frame: [UInt8](data), size: size)
+
+        // Ecamm: Bound work before it reaches decodeQueue. A malformed stream or
+        // stalled VideoToolbox call can no longer build an unbounded queue of
+        // dispatch blocks that each retain a compressed frame.
+        submissionLock.lock()
+        guard acceptingFrames else {
+            submissionLock.unlock()
+            return
+        }
+        pendingSubmission = data
+        let shouldScheduleSubmission = !submissionScheduled
+        submissionScheduled = true
+        submissionLock.unlock()
+
+        if shouldScheduleSubmission {
+            decodeQueue.async { [weak self] in
+                self?.acceptLatestSubmission()
+            }
+        }
+    }
+
+    private func acceptLatestSubmission() {
+        submissionLock.lock()
+        let data = pendingSubmission
+        pendingSubmission = nil
+        submissionScheduled = false
+        let shouldAcceptFrame = acceptingFrames
+        submissionLock.unlock()
+
+        guard shouldAcceptFrame, !invalidated, let data = data else { return }
+        pendingFrame = data
+        submitPendingFrameIfPossible()
+    }
+
+    private func submitPendingFrameIfPossible() {
+        guard !invalidated,
+              !frameInFlight,
+              parameterSet != nil,
+              let data = pendingFrame,
+              initDecoder()
+        else { return }
+
+        pendingFrame = nil
+        frameInFlight = true
+        let decodeState = decode(frame: data)
+        if decodeState != noErr {
+            frameInFlight = false
+            delegate?.log(message: "Decoding failed \(OSErrorCodeDescription(decodeState))", color: .red)
+            submitPendingFrameIfPossible()
         }
     }
     
-    private func decode(frame:[UInt8],size:UInt32) {
+    private func decode(frame:Data) -> OSStatus {
         //
         var blockBuffer: CMBlockBuffer?
-        var frame1 = frame
+        let size = frame.count
         //        var memoryBlock = frame1.withUnsafeMutableBytes({$0}).baseAddress
         //        var ddd = Data(bytes: frame, count: Int(size))
         //Create blockBuffer
@@ -232,18 +304,32 @@ class H265Decoder {
          Parameter 8: flags function and control flags
          Parameter 9: newBBufOut blockBuffer address, cannot be empty
          */
+        // Ecamm: Ask Core Media to allocate and own the block, then copy Data into
+        // it. The previous kCFAllocatorNull block referenced temporary Swift array
+        // storage that could disappear while asynchronous decoding still used it.
         let blockState = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
-                                                            memoryBlock: &frame1,
-                                                            blockLength: Int(size),
-                                                            blockAllocator: kCFAllocatorNull,
+                                                            memoryBlock: nil,
+                                                            blockLength: size,
+                                                            blockAllocator: kCFAllocatorDefault,
                                                             customBlockSource: nil,
                                                             offsetToData:0,
-                                                            dataLength: Int(size),
+                                                            dataLength: size,
                                                             flags: 0,
                                                             blockBufferOut: &blockBuffer)
         if blockState != noErr {
             self.delegate?.log(message: "Failed to create blockBuffer \(OSErrorCodeDescription(blockState))", color: .red)
-            return
+            return blockState
+        }
+        guard let blockBuffer = blockBuffer else {
+            return kCMBlockBufferBadCustomBlockSourceErr
+        }
+        let copyState = frame.withUnsafeBytes { bytes -> OSStatus in
+            guard let baseAddress = bytes.baseAddress else { return kCMBlockBufferBadLengthParameterErr }
+            return CMBlockBufferReplaceDataBytes(with: baseAddress, blockBuffer: blockBuffer, offsetIntoDestination: 0, dataLength: size)
+        }
+        if copyState != noErr {
+            self.delegate?.log(message: "Failed to copy HEVC data into blockBuffer \(OSErrorCodeDescription(copyState))", color: .red)
+            return copyState
         }
         //
         var sampleSizeArray :[Int] = [Int(size)]
@@ -271,10 +357,20 @@ class H265Decoder {
                                                    sampleBufferOut: &sampleBuffer)
         if readyState != noErr {
             self.delegate?.log(message: "Sample Buffer Create Ready failed \(OSErrorCodeDescription(readyState))", color: .red)
-            return
+            return readyState
         }
         
-        guard let decompressionSession = self.decompressionSession, let sampleBuffer = sampleBuffer else { return }
+        guard let decompressionSession = self.decompressionSession, let sampleBuffer = sampleBuffer else { return kVTInvalidSessionErr }
+
+        // Ecamm: Set display-immediately before submitting the sample; changing
+        // attachments after an asynchronous decode has begun is a data race.
+        let attachments:CFArray? = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true)
+        if let attachmentArray = attachments, CFArrayGetCount(attachmentArray) > 0 {
+            let dic = unsafeBitCast(CFArrayGetValueAtIndex(attachmentArray, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(dic,
+                                 Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
         //Decode data
         /*
          Parameter 1: Decoding session
@@ -297,18 +393,30 @@ class H265Decoder {
         }
 //        let numberOfFramesBeingDecoded = kVTDecompressionPropertyKey_NumberOfFramesBeingDecoded
         DispatchQueue.main.async {
-            self.totalBytesDecoded += Int(size)
+            self.totalBytesDecoded += size
 //            self.numberOfFramesBeingDecoded = numberOfFramesBeingDecoded
         }
-        
-        
-        let attachments:CFArray? = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true)
-        if let attachmentArray = attachments {
-            let dic = unsafeBitCast(CFArrayGetValueAtIndex(attachmentArray, 0), to: CFMutableDictionary.self)
 
-            CFDictionarySetValue(dic,
-                                 Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        return decodeState
+    }
+
+    func invalidate() {
+        // Ecamm: Teardown is asynchronous so connection loss cannot wait on the
+        // decoder queue or VideoToolbox from a UI or render-sensitive caller.
+        submissionLock.lock()
+        acceptingFrames = false
+        pendingSubmission = nil
+        submissionLock.unlock()
+
+        decodeQueue.async { [self] in
+            guard !invalidated else { return }
+            invalidated = true
+            pendingFrame = nil
+            frameInFlight = false
+            if let decompressionSession = decompressionSession {
+                VTDecompressionSessionInvalidate(decompressionSession)
+                self.decompressionSession = nil
+            }
         }
     }
     

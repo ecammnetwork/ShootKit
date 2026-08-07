@@ -10,6 +10,11 @@ import Network
 
 class VideoProtocol: NWProtocolFramerImplementation {
 
+    // Ecamm: A corrupt or hostile peer must not be able to make Network.framework
+    // buffer an arbitrarily large message. 16 MB is comfortably above a 1080p HEVC
+    // access unit while still placing a firm upper bound on per-message memory use.
+    static let maximumMessageLength = 16 * 1024 * 1024
+
     // Create a global definition of your game protocol to add to connections.
     static let definition = NWProtocolFramer.Definition(implementation: VideoProtocol.self)
 
@@ -64,6 +69,13 @@ class VideoProtocol: NWProtocolFramerImplementation {
             // which asks for that many more bytes.
             guard parsed, let header = tempHeader else {
                 return headerSize
+            }
+
+            // Ecamm: Fail the connection before deliverInputNoCopy asks the network
+            // stack to accumulate the peer-controlled body length.
+            guard header.length <= UInt32(Self.maximumMessageLength) else {
+                framer.markFailed(error: nil)
+                return 0
             }
 
             // Create an object to deliver the message.

@@ -9,13 +9,19 @@ import Foundation
 import VideoToolbox
 
 protocol H265EncoderDelegate:AnyObject, ConnectionLogger {
-    func videoEncoderDidYieldVideoData(_ encoder : H265Encoder, compressedVideo : Data)
+    func videoEncoderDidYieldVideoData(_ encoder : H265Encoder, compressedVideo : Data, isKeyFrame: Bool)
     func videoEncoderDidExtractParameterSet(_ encoder : H265Encoder, parameterSet: [Data])
     func videoEncoderDidEncodeSampleBuffer(_ encoder: H265Encoder, sampleBuffer: CMSampleBuffer)
     func videoEncoderDidFail(_ encoder: H265Encoder, error: OSStatus)
 }
 
 class H265Encoder {
+    private struct PendingFrame {
+        let pixelBuffer: CVPixelBuffer
+        let presentationTimeStamp: CMTime
+        let duration: CMTime
+    }
+
     weak var delegate : H265EncoderDelegate?
     private var frameID:Int64 = 0
     var parameterSet: [Data]?
@@ -34,10 +40,24 @@ class H265Encoder {
     
     private var encodeQueue = DispatchQueue(label: "encode")
     private var callBackQueue: DispatchQueue
+    private let submissionLock = NSLock()
     
     var encodeSession:VTCompressionSession?
     var encodeCallBack:VTCompressionOutputCallback?
     var codecType: CMVideoCodecType
+    private var callbackRetain: Unmanaged<H265Encoder>?
+    private var pendingFrame: PendingFrame?
+    private var pendingSubmission: PendingFrame?
+    private var submissionScheduled = false
+    private var acceptingFrames = true
+    private var frameInFlight = false
+    private var invalidated = false
+    private var extractedParameterSet = false
+    private var forceNextKeyFrame = false
+
+    // Ecamm: Callers use this after construction to avoid accepting frames when
+    // VideoToolbox could not allocate the required hardware encoder.
+    var isReady: Bool { encodeSession != nil }
     
     init(codecType: CMVideoCodecType = kCMVideoCodecType_HEVC, width:Int32, height:Int32, bitRate : Int32?, fps: Int32?, callbackQueue: DispatchQueue) {
         self.codecType = codecType
@@ -51,31 +71,51 @@ class H265Encoder {
         initVideoToolBox()
     }
     
-    private func initVideoToolBox() {
-        let hevcSupported = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+    @discardableResult
+    private func initVideoToolBox() -> Bool {
+        // Ecamm: The old code checked hardware *decoding* support, which says
+        // nothing about whether a real-time hardware encoder is available.
+        let hevcSupported = VTIsHardwareEncodeSupported(kCMVideoCodecType_HEVC)
         if !hevcSupported {
             delegate?.log(message: "HEVC hardware encoding not supported on this device", color: .systemRed)
-            return
+            return false
         }
+
+        // Ecamm: Video Pencil must never silently fall back to a software encoder
+        // and consume the CPU needed by the host application's primary encoders.
+        let encoderSpecification = [
+            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true
+        ] as CFDictionary
+
+        // Ecamm: VideoToolbox treats refcon as an unmanaged pointer. Retain the
+        // encoder explicitly and balance it in invalidate(), after the session has
+        // stopped issuing callbacks. This avoids both use-after-free and the old
+        // permanent passRetained leak.
+        let callbackRetain = Unmanaged.passRetained(self)
+        self.callbackRetain = callbackRetain
         //create VTCompressionSession
         let state = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: width, height: height, codecType: codecType,
-            encoderSpecification: nil,
+            encoderSpecification: encoderSpecification,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: encodeCallBack ,
-            refcon:
-//                unsafeBitCast(self, to: UnsafeMutableRawPointer.self),
-                 UnsafeMutableRawPointer(Unmanaged.passRetained(self).toOpaque()),
+            refcon: UnsafeMutableRawPointer(callbackRetain.toOpaque()),
             compressionSessionOut: &self.encodeSession)
         
         if state != noErr {
+            callbackRetain.release()
+            self.callbackRetain = nil
             delegate?.log(message: "create VTCompressionSession failed", color: .systemRed)
-            return
+            return false
         }
         
-        guard let encodeSession = encodeSession else { return }
+        guard let encodeSession = encodeSession else {
+            callbackRetain.release()
+            self.callbackRetain = nil
+            return false
+        }
         
         //Set real-time encoding output
         VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -102,14 +142,24 @@ class H265Encoder {
         let bitRatesLimit :CFArray = [bitRate * 2,1] as CFArray
         VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_DataRateLimits, value: bitRatesLimit)
         
-        VTSessionSetProperty(encodeSession, key: kVTVideoEncoderList_IsHardwareAccelerated, value: kCFBooleanTrue)
-//        
         if #available(macOS 11.3, *) {
             VTSessionSetProperty(encodeSession, key: kVTVideoEncoderSpecification_EnableLowLatencyRateControl, value: kCFBooleanTrue)
         }
         
 //        VTSessionSetProperty(encodeSession, key: kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, value: kCFBooleanTrue)
-        
+        let prepareState = VTCompressionSessionPrepareToEncodeFrames(encodeSession)
+        if prepareState != noErr {
+            delegate?.log(message: "prepare VTCompressionSession failed: \(OSErrorCodeDescription(prepareState))", color: .systemRed)
+            // Ecamm: Construction is still synchronous here, so tear down now.
+            // Scheduling invalidate() would briefly report isReady == true.
+            VTCompressionSessionInvalidate(encodeSession)
+            self.encodeSession = nil
+            callbackRetain.release()
+            self.callbackRetain = nil
+            return false
+        }
+
+        return true
     }
     
     private func setCallBack()  {
@@ -118,63 +168,63 @@ class H265Encoder {
             guard let outputCallbackRefCon = outputCallbackRefCon else {return}
             let encoder : H265Encoder =
                  Unmanaged<H265Encoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
-            let callBackQueue = encoder.callBackQueue
-            
-            guard let sampleBuffer = sampleBuffer else {
-                return
-            }
-            
-           
-            /// 0. Raw byte data 8 bytes
-            let buffer : [UInt8] = [0x00,0x00,0x00,0x01]
-            /// 1. [UInt8] -> UnsafeBufferPointer<UInt8>
+            encoder.handleCompressionOutput(status: status, sampleBuffer: sampleBuffer)
+        }
+    }
 
-            
-            let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
-            let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
-            let keyFrame = !notSync // absent or false means this is a sync (key) frame
-            
-            //  Obtain sps pps
-            if keyFrame && encoder.parameterSet == nil{
-                let parameterSet = getParameterSet(sampleBuffer)
-                if parameterSet.count > 0 {
-                    DispatchQueue.main.async { [weak encoder] in
-                        encoder?.parameterSet = parameterSet
-                        encoder?.delegate?.log(message: "Encoding parameters extracted from sampleBuffer: \(parameterSet)", color: .green)
-                    }
-                    callBackQueue.async {
-                        encoder.delegate?.videoEncoderDidExtractParameterSet(encoder, parameterSet: parameterSet)
-                    }
+    private func handleCompressionOutput(status: OSStatus, sampleBuffer: CMSampleBuffer?) {
+        // Ecamm: Every submitted frame must release the one-in-flight slot, even
+        // when VideoToolbox returns an error or no sample buffer.
+        defer {
+            encodeQueue.async { [weak self] in
+                self?.frameInFlight = false
+                self?.submitPendingFrameIfPossible()
+            }
+        }
+
+        guard status == noErr, let sampleBuffer = sampleBuffer else {
+            callBackQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.delegate?.log(message: "HEVC encoder callback failed: \(OSErrorCodeDescription(status))", color: .red)
+                self.delegate?.videoEncoderDidFail(self, error: status)
+            }
+            return
+        }
+
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
+        let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
+        let keyFrame = !notSync // absent or false means this is a sync (key) frame
+
+        // Obtain VPS/SPS/PPS once, before delivering the matching compressed data.
+        if keyFrame && !extractedParameterSet {
+            let parameterSet = getParameterSet(sampleBuffer)
+            if !parameterSet.isEmpty {
+                extractedParameterSet = true
+                DispatchQueue.main.async { [weak self] in
+                    self?.parameterSet = parameterSet
+                }
+                callBackQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.log(message: "Encoding parameters extracted from sampleBuffer: \(parameterSet)", color: .green)
+                    self.delegate?.videoEncoderDidExtractParameterSet(self, parameterSet: parameterSet)
                 }
             }
-            // --------- data input ----------
-            
-            guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-            //                let timeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            //                let timeAgo = CMTimeSubtract(timeStamp, CMClockGetTime(CMClockGetHostTimeClock()))
-            //                encoder.delegate?.log(message: "Encoded buffer with timestamp \(timeStamp.seconds) \(timeAgo.seconds)")
-            //var arr = [Int8]()
-            //let pointer = arr.withUnsafeMutableBufferPointer({$0})
-            var dataPointer: UnsafeMutablePointer<Int8>?  = nil
-            var totalLength :Int = 0
-            let blockState = CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-            if blockState != noErr{
-                encoder.delegate?.log(message: "Failed to get data\(blockState)", color: .red)
-                return
-            }
-            // now dataPointer has our blockBuffer
-            
-            var data = Data(capacity: totalLength)
-            let p = unsafeBitCast(dataPointer, to: UnsafePointer<UInt8>.self)
-            data.append(p, count: totalLength)
-            let byteCount = data.count
-            
-            callBackQueue.async { [weak encoder] in
-                if let encoder = encoder{
-                    encoder.delegate?.videoEncoderDidYieldVideoData(encoder, compressedVideo: data)
-                    encoder.addToTotal(bytes: byteCount)
-                }
-            }
+        }
+
+        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        var totalLength = 0
+        let blockState = CMBlockBufferGetDataPointer(dataBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
+        guard blockState == noErr, let dataPointer = dataPointer, totalLength > 0 else {
+            delegate?.log(message: "Failed to get encoded data \(blockState)", color: .red)
+            return
+        }
+
+        let data = Data(bytes: dataPointer, count: totalLength)
+        callBackQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.delegate?.videoEncoderDidYieldVideoData(self, compressedVideo: data, isKeyFrame: keyFrame)
+            self.addToTotal(bytes: data.count)
         }
     }
     
@@ -182,29 +232,127 @@ class H265Encoder {
     
     //Start coding
     func encode(pixelBuffer:CVPixelBuffer, presentationTimeStamp:CMTime, duration:CMTime){
-        guard VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) else { return }
-        if self.encodeSession == nil {
-            initVideoToolBox()
+        let frame = PendingFrame(pixelBuffer: pixelBuffer,
+                                 presentationTimeStamp: presentationTimeStamp,
+                                 duration: duration)
+
+        // Ecamm: Bound work before it reaches encodeQueue as well. If a
+        // VideoToolbox call stalls that queue, callers still retain only the
+        // newest pixel buffer instead of accumulating dispatch blocks.
+        submissionLock.lock()
+        guard acceptingFrames else {
+            submissionLock.unlock()
+            return
         }
-        encodeQueue.async {[weak self] in
-            guard let self = self, let encodeSession = self.encodeSession else { return }
-            var flags: VTEncodeInfoFlags = VTEncodeInfoFlags()
-            let state = VTCompressionSessionEncodeFrame(encodeSession, imageBuffer: pixelBuffer, presentationTimeStamp: presentationTimeStamp, duration: duration, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
-            if state != noErr{
-                callBackQueue.async{
-                    self.delegate?.log(message: "encode failure \(OSErrorCodeDescription(state))", color: .red)
-                    self.delegate?.videoEncoderDidFail(self, error: state)
-                }
+        pendingSubmission = frame
+        let shouldScheduleSubmission = !submissionScheduled
+        submissionScheduled = true
+        submissionLock.unlock()
+
+        if shouldScheduleSubmission {
+            encodeQueue.async { [weak self] in
+                self?.acceptLatestSubmission()
             }
         }
-        
     }
-    
+
+    private func acceptLatestSubmission() {
+        submissionLock.lock()
+        let frame = pendingSubmission
+        pendingSubmission = nil
+        submissionScheduled = false
+        let shouldAcceptFrame = acceptingFrames
+        submissionLock.unlock()
+
+        guard shouldAcceptFrame, !invalidated, let frame = frame else { return }
+        pendingFrame = frame
+        submitPendingFrameIfPossible()
+    }
+
+    func requestKeyFrame() {
+        // Ecamm: Network backpressure can discard an encoded prediction chain.
+        // Force the next submitted frame to be independently decodable so the
+        // bounded sender can recover without reconnecting.
+        encodeQueue.async { [weak self] in
+            guard let self = self, !self.invalidated else { return }
+            self.forceNextKeyFrame = true
+        }
+    }
+
+    private func submitPendingFrameIfPossible() {
+        guard !invalidated,
+              !frameInFlight,
+              let encodeSession = encodeSession,
+              let frame = pendingFrame
+        else { return }
+
+        // Ecamm: VideoToolbox requires buffers to match the session dimensions.
+        // Reject mismatches instead of repeatedly asking the framework to fail.
+        guard CVPixelBufferGetWidth(frame.pixelBuffer) == Int(width),
+              CVPixelBufferGetHeight(frame.pixelBuffer) == Int(height)
+        else {
+            pendingFrame = nil
+            callBackQueue.async { [weak self] in
+                self?.delegate?.log(message: "Dropped HEVC frame with dimensions that do not match \(self?.width ?? 0)x\(self?.height ?? 0)", color: .red)
+            }
+            return
+        }
+
+        pendingFrame = nil
+        frameInFlight = true
+        var flags = VTEncodeInfoFlags()
+        let frameProperties = forceNextKeyFrame
+            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary
+            : nil
+        let state = VTCompressionSessionEncodeFrame(encodeSession,
+                                                    imageBuffer: frame.pixelBuffer,
+                                                    presentationTimeStamp: frame.presentationTimeStamp,
+                                                    duration: frame.duration,
+                                                    frameProperties: frameProperties,
+                                                    sourceFrameRefcon: nil,
+                                                    infoFlagsOut: &flags)
+        if state == noErr && forceNextKeyFrame {
+            forceNextKeyFrame = false
+        }
+        if state != noErr {
+            frameInFlight = false
+            callBackQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.delegate?.log(message: "encode failure \(OSErrorCodeDescription(state))", color: .red)
+                self.delegate?.videoEncoderDidFail(self, error: state)
+            }
+            submitPendingFrameIfPossible()
+        }
+    }
+
+    func invalidate() {
+        // Ecamm: Teardown is serialized behind any submit already in progress and
+        // never waits synchronously on VideoToolbox or the application's render queue.
+        submissionLock.lock()
+        acceptingFrames = false
+        pendingSubmission = nil
+        submissionLock.unlock()
+
+        encodeQueue.async { [self] in
+            guard !invalidated else { return }
+            invalidated = true
+            pendingFrame = nil
+            frameInFlight = false
+            if let encodeSession = encodeSession {
+                VTCompressionSessionInvalidate(encodeSession)
+                self.encodeSession = nil
+            }
+            callbackRetain?.release()
+            callbackRetain = nil
+        }
+    }
+
     deinit {
+        // Ecamm: invalidate() normally clears the session while the explicit
+        // callback retain still keeps this object alive. This is a final safety net
+        // for construction failures where no session was published.
         if let encodeSession = encodeSession {
-            VTCompressionSessionCompleteFrames(encodeSession, untilPresentationTimeStamp: .invalid)
-            VTCompressionSessionInvalidate(encodeSession);
-//            self.encodeSession = nil;
+            VTCompressionSessionInvalidate(encodeSession)
         }
     }
 }
