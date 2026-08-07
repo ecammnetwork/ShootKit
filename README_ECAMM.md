@@ -31,9 +31,10 @@ so they are easy to review and upstream independently.
   narrow sources are pillarboxed; extra-wide sources are letterboxed.
 - A three-buffer `CVPixelBufferPool` bounds prepared-frame memory. Pool
   exhaustion drops a frame instead of allocating without limit.
-- The HEVC encoder and decoder permit one frame in flight and one newest waiting
-  frame. Their pre-codec dispatch handoffs are latest-only too, so a stalled
-  VideoToolbox queue cannot retain an unbounded sequence of frame closures.
+- The HEVC encoder keeps one frame in flight and one newest raw frame waiting.
+  The decoder instead preserves compressed-frame order in a bounded 12-frame,
+  32 MB queue with up to four VideoToolbox submissions in flight; compressed
+  HEVC prediction frames are never replaced with newer frames.
 - The network sender permits one send in flight and one waiting compressed frame.
   On overflow it discards prediction frames and forces a new keyframe, keeping
   slow Wi-Fi bounded without sending a broken HEVC reference chain.
@@ -48,7 +49,8 @@ so they are easy to review and upstream independently.
   decoding. The old implementation referenced temporary Swift array storage.
 - HEVC parameter-set pointers now reference stable `NSData` storage during Core
   Media format-description creation.
-- Decoder input is latest-frame bounded, matching the outbound encoder policy.
+- Decoder input is FIFO-bounded because compressed prediction frames must stay
+  in sequence; overflow causes the client to reconnect at a clean keyframe.
 - Bonjour, connection, and viability handlers capture the client weakly and are
   cleared during teardown.
 - Connection loss notifies the host before clearing the connection, so a

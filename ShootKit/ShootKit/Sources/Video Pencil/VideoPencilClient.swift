@@ -823,5 +823,10 @@ extension VideoPencilClient: H265DecoderDelegate {
     func videoDecoder(_ decoder: H265Decoder, failedWith error: OSStatus) {
         guard decoder === self.decoder else { return }
         log(message: "Video Pencil decoder failed: \(OSErrorCodeDescription(error))", color: .red)
+        // Ecamm: A damaged HEVC reference chain cannot recover reliably by
+        // continuing to feed prediction frames. Reconnect once so Video Pencil
+        // starts a clean stream with a new parameter set and keyframe.
+        stopConnection(notifyDelegate: true)
+        scheduleReconnect()
     }
 }

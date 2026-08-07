@@ -15,6 +15,12 @@ protocol H265DecoderDelegate:AnyObject, ConnectionLogger{
 }
 
 class H265Decoder {
+    // Ecamm: Preserve compressed HEVC ordering while keeping a firm memory bound.
+    // Prediction frames cannot be replaced with a newer frame like raw video can.
+    private static let maximumQueuedFrames = 12
+    private static let maximumQueuedBytes = 32 * 1024 * 1024
+    private static let maximumFramesInFlight = 4
+
     weak var delegate : H265DecoderDelegate?
     var expectsNalu: Bool = true
     var width: Int32
@@ -32,11 +38,12 @@ class H265Decoder {
     
     var decompressionSession : VTDecompressionSession?
     var callback : VTDecompressionOutputCallback?
-    private var pendingFrame: Data?
-    private var pendingSubmission: Data?
+    private var queuedSubmissions = [Data]()
+    private var queuedSubmissionBytes = 0
     private var submissionScheduled = false
+    private var submissionOverflowed = false
     private var acceptingFrames = true
-    private var frameInFlight = false
+    private var framesInFlight = 0
     private var invalidated = false
     
     var pixelBufferPool: CVPixelBufferPool?
@@ -60,7 +67,7 @@ class H265Decoder {
             DispatchQueue.main.async { [weak self] in
                 self?.parameterSetView = newParameterSet
             }
-            self.submitPendingFrameIfPossible()
+            self.scheduleSubmissionDrain()
         }
     }
     
@@ -200,12 +207,12 @@ class H265Decoder {
                 //unsafeBitCast(decompressionOutputRefCon, to: H265Decoder.self)
              Unmanaged<H265Decoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
 
-            // Ecamm: Release the in-flight slot on every callback path, including
-            // decoder errors that do not contain an image buffer.
+            // Ecamm: Release one of the bounded asynchronous decoder slots on
+            // every callback path, then submit the next compressed frame in order.
             defer {
                 decoder.decodeQueue.async {
-                    decoder.frameInFlight = false
-                    decoder.submitPendingFrameIfPossible()
+                    decoder.framesInFlight = max(0, decoder.framesInFlight - 1)
+                    decoder.submitQueuedFramesIfPossible()
                 }
             }
 
@@ -235,54 +242,99 @@ class H265Decoder {
             return
         }
 
-        // Ecamm: Bound work before it reaches decodeQueue. A malformed stream or
-        // stalled VideoToolbox call can no longer build an unbounded queue of
-        // dispatch blocks that each retain a compressed frame.
+        // Ecamm: Queue compressed frames in arrival order. Replacing an HEVC
+        // prediction frame with a newer one corrupts the decoder reference chain.
         submissionLock.lock()
         guard acceptingFrames else {
             submissionLock.unlock()
             return
         }
-        pendingSubmission = data
+
+        let wouldOverflow = queuedSubmissions.count >= Self.maximumQueuedFrames ||
+            queuedSubmissionBytes > Self.maximumQueuedBytes - data.count
+        if wouldOverflow {
+            let shouldReportOverflow = !submissionOverflowed
+            submissionOverflowed = true
+            submissionLock.unlock()
+
+            if shouldReportOverflow {
+                callBackQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.log(message: "HEVC decoder input queue overflowed", color: .red)
+                    self.delegate?.videoDecoder(self, failedWith: kVTVideoDecoderMalfunctionErr)
+                }
+            }
+            return
+        }
+
+        queuedSubmissions.append(data)
+        queuedSubmissionBytes += data.count
         let shouldScheduleSubmission = !submissionScheduled
         submissionScheduled = true
         submissionLock.unlock()
 
         if shouldScheduleSubmission {
             decodeQueue.async { [weak self] in
-                self?.acceptLatestSubmission()
+                self?.submitQueuedFramesIfPossible()
             }
         }
     }
 
-    private func acceptLatestSubmission() {
+    private func scheduleSubmissionDrain() {
         submissionLock.lock()
-        let data = pendingSubmission
-        pendingSubmission = nil
-        submissionScheduled = false
-        let shouldAcceptFrame = acceptingFrames
+        let shouldSchedule = acceptingFrames &&
+            !queuedSubmissions.isEmpty &&
+            !submissionScheduled
+        if shouldSchedule {
+            submissionScheduled = true
+        }
         submissionLock.unlock()
 
-        guard shouldAcceptFrame, !invalidated, let data = data else { return }
-        pendingFrame = data
-        submitPendingFrameIfPossible()
+        if shouldSchedule {
+            decodeQueue.async { [weak self] in
+                self?.submitQueuedFramesIfPossible()
+            }
+        }
     }
 
-    private func submitPendingFrameIfPossible() {
-        guard !invalidated,
-              !frameInFlight,
-              parameterSet != nil,
-              let data = pendingFrame,
-              initDecoder()
-        else { return }
+    private func nextQueuedSubmission() -> Data? {
+        submissionLock.lock()
+        guard !queuedSubmissions.isEmpty else {
+            submissionScheduled = false
+            submissionLock.unlock()
+            return nil
+        }
+        let data = queuedSubmissions.removeFirst()
+        queuedSubmissionBytes -= data.count
+        submissionLock.unlock()
+        return data
+    }
 
-        pendingFrame = nil
-        frameInFlight = true
-        let decodeState = decode(frame: data)
-        if decodeState != noErr {
-            frameInFlight = false
-            delegate?.log(message: "Decoding failed \(OSErrorCodeDescription(decodeState))", color: .red)
-            submitPendingFrameIfPossible()
+    private func submitQueuedFramesIfPossible() {
+        guard !invalidated else { return }
+        guard parameterSet != nil, initDecoder() else {
+            // A parameter set normally arrives before the first frame. Allow its
+            // setter to restart this preserved queue when it becomes available.
+            submissionLock.lock()
+            submissionScheduled = false
+            submissionLock.unlock()
+            return
+        }
+
+        while framesInFlight < Self.maximumFramesInFlight,
+              let data = nextQueuedSubmission() {
+            framesInFlight += 1
+            let decodeState = decode(frame: data)
+            if decodeState != noErr {
+                // A synchronous rejection does not produce a callback, so release
+                // its slot here and let the client restart the damaged stream.
+                framesInFlight -= 1
+                callBackQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.delegate?.videoDecoder(self, failedWith: decodeState)
+                }
+                return
+            }
         }
     }
     
@@ -405,14 +457,14 @@ class H265Decoder {
         // decoder queue or VideoToolbox from a UI or render-sensitive caller.
         submissionLock.lock()
         acceptingFrames = false
-        pendingSubmission = nil
+        queuedSubmissions.removeAll()
+        queuedSubmissionBytes = 0
         submissionLock.unlock()
 
         decodeQueue.async { [self] in
             guard !invalidated else { return }
             invalidated = true
-            pendingFrame = nil
-            frameInFlight = false
+            framesInFlight = 0
             if let decompressionSession = decompressionSession {
                 VTDecompressionSessionInvalidate(decompressionSession)
                 self.decompressionSession = nil
