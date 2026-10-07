@@ -10,6 +10,9 @@ import Network
 
 class VideoProtocol: NWProtocolFramerImplementation {
 
+    // Ecamm: Reject corrupt peer-controlled sizes before Network buffers the body.
+    static let maximumMessageLength = 16 * 1024 * 1024
+
     // Create a global definition of your game protocol to add to connections.
     static let definition = NWProtocolFramer.Definition(implementation: VideoProtocol.self)
 
@@ -25,6 +28,11 @@ class VideoProtocol: NWProtocolFramerImplementation {
 
     // Whenever the application sends a message, add your protocol header and forward the bytes.
     func handleOutput(framer: NWProtocolFramer.Instance, message: NWProtocolFramer.Message, messageLength: Int, isComplete: Bool) {
+        // Ecamm: Apply the same bound before converting a local Int to UInt32.
+        guard messageLength <= Self.maximumMessageLength else {
+            framer.markFailed(error: nil)
+            return
+        }
         // Extract the type of message.
         let type = message.videoMessageType
 
@@ -64,6 +72,12 @@ class VideoProtocol: NWProtocolFramerImplementation {
             // which asks for that many more bytes.
             guard parsed, let header = tempHeader else {
                 return headerSize
+            }
+
+            // Ecamm: An oversized packet terminates this stream, never a partial frame drop.
+            guard header.length <= UInt32(Self.maximumMessageLength) else {
+                framer.markFailed(error: nil)
+                return 0
             }
 
             // Create an object to deliver the message.

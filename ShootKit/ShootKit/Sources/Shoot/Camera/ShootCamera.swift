@@ -78,11 +78,15 @@ import VideoToolbox
             awaitNextMessage()
         case .failed(let error):
             log("Shoot connection failed -- \(error.debugDescription)", color: .systemRed)
+            // Ecamm: Shared decoder callbacks must finish before their owner is released.
+            decoder?.invalidate()
             decoder = nil
             delegate?.shootCameraWasDisconnected(camera: self)
         case .cancelled:
             // guaranteed to be final
             log("Shoot connection failed", color: .systemRed)
+            // Ecamm: Use the same asynchronous teardown on cancellation.
+            decoder?.invalidate()
             decoder = nil
             delegate?.shootCameraWasDisconnected(camera: self)
         default:
@@ -124,7 +128,7 @@ import VideoToolbox
                 // this can happen in response to a video request but also if the resolution or frame rate changes
                 self.createDecoder()
                 
-                self.decoder?.parameterSet = parameterSet.parameters
+                self.decoder?.setParameterSet(parameterSet.parameters)
             }else{
                 self.log(message: "Error parsing HEVC parameter set from iPad \(data)", color: .systemRed)
             }
@@ -157,6 +161,8 @@ import VideoToolbox
     
         if decoder != nil {
             log("Removing old decoder", color: .orange)
+            // Ecamm: Replacing a decoder also invalidates its outstanding callbacks.
+            decoder?.invalidate()
             decoder = nil
         }
         

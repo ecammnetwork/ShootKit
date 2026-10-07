@@ -15,10 +15,20 @@ import CoreImage
     func videoPencilDidConnect(_ client: VideoPencilClient)
     func videoPencilDidDisconnect(_ client: VideoPencilClient)
     func videoPencilDidReceive(from: VideoPencilClient, frame: CIImage, presentationTimeStamp: CMTime, presentationDuration: CMTime)
+    // Ecamm: Approval precedes TCP/video; existing hosts retain automatic discovery.
+    @objc optional func videoPencil(_ client: VideoPencilClient, shouldConnectToDeviceNamed name: String,
+                                    identifier: String, decisionHandler: @escaping (Bool) -> Void)
+    // Ecamm: The XPC host stops producing frames when the iPad stops requesting them.
+    @objc optional func videoPencil(_ client: VideoPencilClient, streamingChanged streaming: Bool)
 }
 
 @objc public class VideoPencilClient: NSObject, ObservableObject{
     public var logger = BaseConnectionLogger()
+    // Ecamm: Route framework diagnostics back through the application's EcammLog.
+    @objc public var logHandler: ((String) -> Void)?
+    @objc public private(set) var remoteDeviceName = ""
+    @objc public private(set) var remoteDeviceIdentifier = ""
+    @objc public private(set) var isStreaming = false
     
     @objc public var name: String
     @objc public var size: CGSize
@@ -41,6 +51,13 @@ import CoreImage
     let bonjourBrowser = ShootKit.nwBrowser(for: .videoPencilApp)
     
     var hasSentParameterSet = false
+    // Ecamm: Connection state is queue-confined. Generations reject obsolete approvals/retries.
+    private var generation = 0
+    private var authorizationPending = false
+    private var receivePending = false
+    private var notifiedConnected = false
+    private var reconnectPending = false
+    private var explicitlyStopped = false
     
     public var hasConnection: Bool{
         connection != nil
@@ -59,7 +76,9 @@ import CoreImage
     }
     
     func startBonjourDiscovery(){
-        bonjourBrowser.browseResultsChangedHandler = {newResults, changes in // main thread
+        bonjourBrowser.browseResultsChangedHandler = { [weak self] newResults, changes in // main thread
+            // Ecamm: Network.framework invokes this on queue, not the main thread.
+            guard let self, !self.explicitlyStopped else { return }
             self.log(message: "Bonjour results changed \(newResults.debugDescription)", color: NSColor.brown)
 
             if let connection = self.connection{
@@ -67,37 +86,80 @@ import CoreImage
                 if myEndpointDisappeared{
                     // endpoint that was being used has disappeared
                     self.log(message: "Video Pencil endpoint disappeared, cancelling connection", color: .red)
-                    self.connection?.cancel()
                     self.stop()
+                    self.scheduleReconnect()
                 }
             }else{
                 if let result = newResults.first {
-                    self.connectTo_iPad(at: result)
+                    self.connectIfAuthorized(to: result)
                 }
             }
         }
         if let service = bonjourBrowser.browseResults.first{
-            connectTo_iPad(at: service)
+            connectIfAuthorized(to: service)
         }
         bonjourBrowser.start(queue: queue)
     }
     
 
     func start(){
+        guard !explicitlyStopped, connection == nil else { return }
         if let result = bonjourBrowser.browseResults.first{
-            connectTo_iPad(at: result)
+            connectIfAuthorized(to: result)
         }
     }
     
     func tryReconnecting(){
         stop()
-        start()
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        // Ecamm: Coalesce failure/viability events, and never retry a revoked connection.
+        guard !explicitlyStopped, !reconnectPending else { return }
+        reconnectPending = true
+        let requestedGeneration = generation
+        queue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.generation == requestedGeneration else { return }
+            self.reconnectPending = false
+            self.start()
+        }
+    }
+
+    private func connectIfAuthorized(to result: NWBrowser.Result) {
+        guard !explicitlyStopped, connection == nil, !authorizationPending else { return }
+        guard case let .service(name, _, _, _) = result.endpoint else { return }
+        remoteDeviceIdentifier = name
+        remoteDeviceName = name.hasPrefix("Video Pencil on ") ? String(name.dropFirst(16)) : name
+        authorizationPending = true
+        let requestedGeneration = generation
+        let displayName = remoteDeviceName
+        let decision: (Bool) -> Void = { [weak self] allowed in
+            guard let self else { return }
+            self.queue.async { [weak self] in
+                guard let self, self.generation == requestedGeneration, self.authorizationPending else { return }
+                self.authorizationPending = false
+                guard allowed, !self.explicitlyStopped, self.connection == nil,
+                      self.bonjourBrowser.browseResults.contains(where: { $0.endpoint == result.endpoint }) else { return }
+                self.connectTo_iPad(at: result)
+            }
+        }
+        // Ecamm: UI decisions stay on main; the result returns to the connection queue.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.delegate?.videoPencil?(self, shouldConnectToDeviceNamed: displayName,
+                                           identifier: name, decisionHandler: decision) == nil {
+                decision(true)
+            }
+        }
     }
 
     private func connectTo_iPad(at networkBrowserResult: NWBrowser.Result){
         if connection != nil {
             log(message: "Removing existing Video Pencil connection", color: .systemOrange)
             connection?.cancel()
+            decoder?.invalidate()
+            encoder?.invalidate()
             decoder = nil
             encoder = nil
             connection = nil
@@ -105,9 +167,14 @@ import CoreImage
         log(message: "Attempt to connect to Video Pencil at \(networkBrowserResult) port \(networkBrowserResult.metadata)", color: .systemMint)
         let connection = NWConnection(to: networkBrowserResult.endpoint, using: ShootKit.applicationServiceParameters())
 
-        connection.stateUpdateHandler = handleConnectionStateChanges
+        // Ecamm: Old handlers must neither retain this client nor affect a replacement connection.
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection, connection === self.connection else { return }
+            self.handleConnectionStateChanges(newState: state)
+        }
         
-        connection.viabilityUpdateHandler = { isViable in
+        connection.viabilityUpdateHandler = { [weak self, weak connection] isViable in
+            guard let self, let connection, connection === self.connection else { return }
             if !isViable{
                 self.log(message: "Connection viability lost, attempt reconnection", color: .systemRed)
                 self.tryReconnecting()
@@ -116,19 +183,18 @@ import CoreImage
         // send the device name with the initial connection
         connection.send(content: name.data(using: .unicode), completion: .idempotent)
         
-        connection.start(queue: queue)
         self.connection = connection
-        queue.async {
-            self.connection = connection // eesh
-        }
-        awaitNextMessage()
+        connection.start(queue: queue)
+        // Ecamm: Publish once, before callbacks; begin the sole receive loop only on ready.
     }
     func handleConnectionStateChanges(newState: NWConnection.State){
         guard let connection = connection else { return }
         switch(newState){
         case .ready:
             log(message: "Video Pencil connection ready, awaiting message", color: .systemMint)
-            DispatchQueue.main.async {
+            notifiedConnected = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
                 self.delegate?.videoPencilDidConnect(self)
             }
             awaitNextMessage()
@@ -142,10 +208,8 @@ import CoreImage
         case .cancelled:
             // guaranteed to be final
             log(message: "Video Pencil connection cancelled \(connection.endpoint.debugDescription)", color: .systemRed)
-            DispatchQueue.main.async {
-                self.connection = nil
-                self.delegate?.videoPencilDidDisconnect(self)
-            }
+            stop()
+            scheduleReconnect()
         default: // preparing
             log(message: "Video Pencil Connection state changed to \(newState)", color: .orange)
             break
@@ -153,13 +217,27 @@ import CoreImage
     }
 
     func startVideoStream(){
+        cancelVideoStream()
         hasSentParameterSet = false
-        encoder = H265Encoder(width: 1920, height: 1080, bitRate: encoderBitRate, fps: 30, callbackQueue: queue)
-        encoder?.delegate = self
+        encoder = H265Encoder(width: 1920, height: 1080, bitRate: encoderBitRate, fps: 30, callbackQueue: queue, delegate: self)
+        guard encoder?.isReady == true else {
+            encoder?.invalidate()
+            encoder = nil
+            return
+        }
+        isStreaming = true
+        delegate?.videoPencil?(self, streamingChanged: true)
     }
     
     func cancelVideoStream(){
+        // Ecamm: Stop producer work before asynchronously invalidating the codec.
+        if isStreaming {
+            isStreaming = false
+            delegate?.videoPencil?(self, streamingChanged: false)
+        }
+        encoder?.invalidate()
         encoder = nil
+        hasSentParameterSet = false
     }
     
     func send<T>(basicMessage: BasicControlMessage<T>){
@@ -173,13 +251,20 @@ import CoreImage
             }
         }))
             
-        awaitNextMessage()
+        // Ecamm: Sending control data does not start another receive chain.
     }
     
     func awaitNextMessage(){
-        connection?.receiveMessage(completion: { content, context, isComplete, error in
+        // Ecamm: Exactly one receive is outstanding, and stale callbacks are ignored.
+        guard !receivePending, let current = connection, current.state == .ready else { return }
+        receivePending = true
+        current.receiveMessage(completion: { [weak self, weak current] content, context, isComplete, error in
+            guard let self, let current, current === self.connection else { return }
+            self.receivePending = false
 //            self.log(message: "Got message \(content)")
-            if let message = context?.protocolMetadata(definition: VideoProtocol.definition) as? NWProtocolFramer.Message, let frame = content{
+            if let message = context?.protocolMetadata(definition: VideoProtocol.definition) as? NWProtocolFramer.Message {
+                // Ecamm: Stream-control packets can legitimately have no body.
+                let frame = content ?? Data()
                 switch message.videoMessageType{
                 case .requestVideoStream:
                     self.cancelVideoStream()
@@ -191,12 +276,12 @@ import CoreImage
                     self.cancelVideoStream()
                     
                 case .hevcParameterSet:
-                    if let parameterSet = try? JSONDecoder().decode(H265ParameterSet.self, from: frame){
+                    if frame.count <= 64 * 1024, let parameterSet = try? JSONDecoder().decode(H265ParameterSet.self, from: frame){
                         self.log(message: "HEVC parameter set received from Video Pencil (\(parameterSet.parameters), decoder exists? \(self.decoder != nil))", color: .systemOrange)
                         // received pencil layer parameterSet
                         self.createDecoderIfNeeded()
                         
-                        self.decoder?.parameterSet = parameterSet.parameters
+                        self.decoder?.setParameterSet(parameterSet.parameters)
                     }else{
                         self.log(message: "Error parsing HEVC parameter set from Video Pencil \(frame)", color: .systemRed)
                     }
@@ -213,6 +298,7 @@ import CoreImage
             }
             if let error = error {
                 self.log(message: "Error receiving message \(error)", color: .red)
+                self.tryReconnecting()
             }else{
                 self.awaitNextMessage()
             }
@@ -251,11 +337,9 @@ import CoreImage
             // scale it down
             let scale = 1080 / minDimension
             let scaled = image.transformed(by: .init(scaleX: scale, y: scale))
-            if let current = scaledReferencePixelBuffer, CVPixelBufferGetWidth(current) == Int(image.extent.width), CVPixelBufferGetHeight(current) == Int(image.extent.height){
-                
-            }else{
-                scaledReferencePixelBuffer = CIImage.createPixelBuffer(width: Int(scaled.extent.width), height: Int(scaled.extent.height))
-            }
+            // Ecamm: The asynchronous encoder may still own the previous raster.
+            // Never overwrite it. Ecamm's XPC caller normally supplies a direct buffer.
+            scaledReferencePixelBuffer = CIImage.createPixelBuffer(width: Int(scaled.extent.width), height: Int(scaled.extent.height))
             if let scaledReferencePixelBuffer{
                 ciContext.render(scaled, to: scaledReferencePixelBuffer)
             }
@@ -265,9 +349,8 @@ import CoreImage
             if let b = image.pixelBuffer{
                 pixelBuffer = b
             }else{
-                if referencePixelBuffer == nil || CVPixelBufferGetWidth(referencePixelBuffer!) != Int(image.extent.width) || CVPixelBufferGetHeight(referencePixelBuffer!) != Int(image.extent.height){
-                    referencePixelBuffer = CIImage.createPixelBuffer(width: Int(image.extent.width), height: Int(image.extent.height))
-                }
+                // Ecamm: Rasterize lazy images into separate owned storage before return.
+                referencePixelBuffer = CIImage.createPixelBuffer(width: Int(image.extent.width), height: Int(image.extent.height))
                 if let referencePixelBuffer{
                     ciContext.render(image, to: referencePixelBuffer)
                     pixelBuffer = referencePixelBuffer
@@ -280,10 +363,46 @@ import CoreImage
     }
     
     public func stop(){
+        // Ecamm: Clear callbacks before cancellation and notify even though connection
+        // is about to become nil. The original cancelled callback could lose this event.
+        generation += 1
+        reconnectPending = false
+        authorizationPending = false
+        receivePending = false
+        connection?.stateUpdateHandler = nil
+        connection?.viabilityUpdateHandler = nil
         connection?.cancel()
         connection = nil
-        encoder = nil
+        cancelVideoStream()
+        decoder?.invalidate()
         decoder = nil
+        if notifiedConnected {
+            notifiedConnected = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.delegate?.videoPencilDidDisconnect(self)
+            }
+        }
+    }
+
+    @objc public func disconnect() {
+        // Ecamm: Explicit revocation stays stopped until the host authorizes a restart.
+        queue.async { [weak self] in self?.explicitlyStopped = true; self?.stop() }
+    }
+
+    @objc public func reconnect() {
+        queue.async { [weak self] in self?.explicitlyStopped = false; self?.start() }
+    }
+
+    deinit {
+        // Ecamm: Break callback ownership and stop codecs when the XPC host replaces us.
+        bonjourBrowser.browseResultsChangedHandler = nil
+        bonjourBrowser.cancel()
+        connection?.stateUpdateHandler = nil
+        connection?.viabilityUpdateHandler = nil
+        connection?.cancel()
+        encoder?.invalidate()
+        decoder?.invalidate()
     }
 }
 
@@ -318,24 +437,27 @@ extension CIImage{
 
 extension VideoPencilClient: H265EncoderDelegate{
     func videoEncoderDidExtractParameterSet(_ encoder: H265Encoder, parameterSet frames: [Data]) {
-        guard let connection = connection else { return }
+        guard encoder === self.encoder, let connection = connection else { return }
         log(message: "Sending encoder parameters to Video Pencil: \(frames.map{$0})", color: .blue)
         
         let message = NWProtocolFramer.Message(videoMessageType: .hevcParameterSet)
         let context = NWConnection.ContentContext(identifier: "parameterSet", metadata: [message])
         let parameterSet = H265ParameterSet(parameters: frames)
-        let data = try! JSONEncoder().encode(parameterSet)
+        guard let data = try? JSONEncoder().encode(parameterSet) else { return }
         
-        connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self] error in
+        connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self, weak connection, weak encoder] error in
+            guard let self, let connection, connection === self.connection, let encoder, encoder === self.encoder else { return }
             if let error = error {
-                self?.log(message: "Error sending frame " + error.debugDescription, color: .red)
-            }else{
-                self?.hasSentParameterSet = true
+                self.log(message: "Error sending frame " + error.debugDescription, color: .red)
+                self.tryReconnecting()
             }
         }))
+        // Ecamm: Network preserves queued-send order. Mark after enqueue, not after
+        // completion, so the initial keyframe is never discarded while parameters send.
+        hasSentParameterSet = true
     }
     func videoEncoderDidYieldVideoData(_ encoder: H265Encoder, compressedVideo data: Data) {
-        guard let connection = connection, hasSentParameterSet else {
+        guard encoder === self.encoder, let connection = connection, hasSentParameterSet else {
             log("VideoPencilClient Ignoring frame, no keyframe received yet", color: .orange)
             return
         }
@@ -359,28 +481,36 @@ extension VideoPencilClient: H265EncoderDelegate{
     func videoEncoderDidEncodeSampleBuffer(_ encoder: H265Encoder, sampleBuffer: CMSampleBuffer) {
     }
     func videoEncoderDidFail(_ encoder: H265Encoder, error: OSStatus) {
-        if error == kVTInvalidSessionErr{
-            self.encoder = nil
-        }
+        // Ecamm: Ignore retired codecs; report and stop a genuinely failed stream.
+        guard encoder === self.encoder else { return }
+        log(message: "Video Pencil encoder failed: \(OSErrorCodeDescription(error))", color: .red)
+        cancelVideoStream()
     }
 }
 
 extension VideoPencilClient: ConnectionLogger{
     public func log(_ text: String, color: NSColor) {
-        logger.log(text, color: color)
+        // Ecamm: A host hook replaces emoji-only output; fallback remains searchable.
+        if let logHandler { logHandler(text) } else { print("VideoPencil:", text) }
     }
     public func log(message: String, color: NSColor) {
-        logger.log(message: message, color: color)
+        log(message, color: color)
     }
 }
 
 extension VideoPencilClient: H265DecoderDelegate{
     
     func videoDecoderDidDecodePixelBuffer(_ decoder: H265Decoder, pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
+        // Ecamm: A cancelled decoder cannot publish drawings into its replacement.
+        guard decoder === self.decoder else { return }
         delegate?.videoPencilDidReceive(from: self, frame: CIImage(cvPixelBuffer: pixelBuffer), presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
     }
     
     func videoDecoder(_ decoder: H265Decoder, failedWith error: OSStatus) {
         // handle error
+        // Ecamm: Reset the whole compressed prediction chain, not arbitrary individual frames.
+        guard decoder === self.decoder else { return }
+        log(message: "Video Pencil decoder failed: \(OSErrorCodeDescription(error))", color: .red)
+        tryReconnecting()
     }
 }
