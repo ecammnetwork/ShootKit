@@ -107,6 +107,10 @@ extension CGFloat:SliderValueType{
         self.init(fromFloat)
     }
 }
+// Ecamm: SliderValueType requires Apple's CMTime: Hashable conformance, which
+// exists only on macOS 13+. Video Pencil never uses CMTime as a slider value;
+// guard this camera-control conformance so the rest of ShootKit supports 11.2.
+@available(macOS 13.0, *)
 extension CMTime:SliderValueType{
     public var toFloat: Float { Float(seconds) }
     public var conciseString: String { seconds > 0 ? "1/\(Int(1/seconds))" : "0" }
