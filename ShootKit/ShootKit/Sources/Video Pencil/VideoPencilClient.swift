@@ -219,7 +219,15 @@ import CoreImage
     func startVideoStream(){
         cancelVideoStream()
         hasSentParameterSet = false
-        encoder = H265Encoder(width: 1920, height: 1080, bitRate: encoderBitRate, fps: 30, callbackQueue: queue, delegate: self)
+        // Ecamm: Honor the host's requested feed size so its 960x540 snapshots are
+        // actually encoded at 540p, not fed into the original hard-coded 1080p session.
+        // Validate before converting CGSize; the independent drawing decoder stays 1080p.
+        guard let width = Int32(exactly: size.width), let height = Int32(exactly: size.height),
+              width > 0, height > 0 else {
+            log(message: "Invalid Video Pencil encoder size: \(size)", color: .systemRed)
+            return
+        }
+        encoder = H265Encoder(width: width, height: height, bitRate: encoderBitRate, fps: 30, callbackQueue: queue, delegate: self)
         guard encoder?.isReady == true else {
             encoder?.invalidate()
             encoder = nil

@@ -60,6 +60,11 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - An optional streaming-state callback lets Ecamm stop preparing source frames
   when the iPad cancels its stream, even if the TCP connection remains open.
 - Decoder output is IOSurface-backed for the helper's cross-process handoff.
+- Encoder dimensions honor the client's requested `size`, with checked integer
+  conversion. Ecamm's 540p smoothness comparison supplies 960x540 snapshots;
+  leaving the encoder hard-coded to 1920x1080 would not test actual 540p encoding.
+  The incoming drawing decoder remains 1920x1080. Frame rate, bitrate, and
+  keyframe settings are unchanged, and hosts supplying 1920x1080 keep that size.
 - `ShootCamera` uses the decoder's queue-confined parameter setter and explicit
   invalidation too, so shared decoder changes do not leave that caller behind.
 
