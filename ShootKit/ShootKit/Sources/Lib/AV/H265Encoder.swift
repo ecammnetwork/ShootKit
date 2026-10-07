@@ -113,9 +113,9 @@ class H265Encoder {
         
         //Bit rate limit
         // Ecamm: DataRateLimits uses [bytes, seconds], unlike AverageBitRate's bits/second.
-        // Allow twice the average over one second, converting to bytes with a wide intermediate.
-        // At 480,000 bps this is 120,000 bytes/second (960,000 bps), not 960,000 bytes/second.
-        let bitRatesLimit :CFArray = [Int64(bitRate) * 2 / 8, 1] as CFArray
+        // Allow three times the average over one second for motion, converting to bytes with a wide intermediate.
+        // At 900,000 bps this is 337,500 bytes/second (2,700,000 bps), not 2,700,000 bytes/second.
+        let bitRatesLimit :CFArray = [Int64(bitRate) * 3 / 8, 1] as CFArray
         let limitStatus = VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_DataRateLimits, value: bitRatesLimit)
         if limitStatus != noErr {
             delegate?.log(message: "Could not set bitrate limit: \(OSErrorCodeDescription(limitStatus))", color: .systemRed)

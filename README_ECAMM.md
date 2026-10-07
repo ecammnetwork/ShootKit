@@ -67,11 +67,12 @@ the earlier attempts to change codec/network timing to cure that glitch.
   settings are unchanged, and hosts supplying 1920x1080 keep that size.
 - `encoderBitRate` is exposed to Objective-C hosts, in bits/second, and must be
   set on the owner queue before streaming starts. Its upstream default remains
-  1,920,000 bps; Ecamm now requests 1,200,000 bps for its 960x540 feed.
+  1,920,000 bps; Ecamm now requests 900,000 bps for its 960x540 feed.
 - The encoder's one-second burst limit now correctly converts bits to bytes:
-  `[Int64(bitRate) * 2 / 8, 1]`. At 1.2 Mbps this requests a 300,000-byte limit
-  (2.4 Mbps), twice the average. The old formula accidentally requested sixteen
-  times the average. Rejected average/limit settings are logged through the host.
+  `[Int64(bitRate) * 3 / 8, 1]`. At 900 kbps this requests a 337,500-byte limit
+  (2.7 Mbps), three times the average, giving motion more headroom than the
+  previous 2.4 Mbps cap. The original bits/bytes bug accidentally requested
+  sixteen times the average. Rejected settings are logged through the host.
 - `ShootCamera` uses the decoder's queue-confined parameter setter and explicit
   invalidation too, so shared decoder changes do not leave that caller behind.
 - The unused `CMTime: SliderValueType` camera-control conformance is restricted
