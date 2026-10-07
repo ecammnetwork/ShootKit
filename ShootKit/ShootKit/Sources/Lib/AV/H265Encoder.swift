@@ -105,13 +105,23 @@ class H265Encoder {
         //Code rate calculation formula reference notes
         //        var bitrate = width * height * 3 * 4
         let bitrateAverage = CFNumberCreate(kCFAllocatorDefault, CFNumberType.intType, &bitRate)
-        VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateAverage)
+        let averageStatus = VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrateAverage)
+        // Ecamm: Log rejected settings instead of silently assuming the requested rate was applied.
+        if averageStatus != noErr {
+            delegate?.log(message: "Could not set average bitrate: \(OSErrorCodeDescription(averageStatus))", color: .systemRed)
+        }
         
         //Bit rate limit
-        let bitRatesLimit :CFArray = [bitRate * 2,1] as CFArray
-        VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_DataRateLimits, value: bitRatesLimit)
+        // Ecamm: DataRateLimits uses [bytes, seconds], unlike AverageBitRate's bits/second.
+        // Allow twice the average over one second, converting to bytes with a wide intermediate.
+        // At 480,000 bps this is 120,000 bytes/second (960,000 bps), not 960,000 bytes/second.
+        let bitRatesLimit :CFArray = [Int64(bitRate) * 2 / 8, 1] as CFArray
+        let limitStatus = VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_DataRateLimits, value: bitRatesLimit)
+        if limitStatus != noErr {
+            delegate?.log(message: "Could not set bitrate limit: \(OSErrorCodeDescription(limitStatus))", color: .systemRed)
+        }
 
-        // Ecamm: Deliberately preserve Michael's keyframe/rate-control defaults.
+        // Ecamm: Deliberately preserve Michael's keyframe and other codec defaults.
         // There is no new MaxFrameDelayCount, pacing algorithm, or submission window.
         
         VTSessionSetProperty(encodeSession, key: kVTVideoEncoderList_IsHardwareAccelerated, value: kCFBooleanTrue)

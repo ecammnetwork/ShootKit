@@ -63,8 +63,15 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - Encoder dimensions honor the client's requested `size`, with checked integer
   conversion. Ecamm's 540p smoothness comparison supplies 960x540 snapshots;
   leaving the encoder hard-coded to 1920x1080 would not test actual 540p encoding.
-  The incoming drawing decoder remains 1920x1080. Frame rate, bitrate, and
-  keyframe settings are unchanged, and hosts supplying 1920x1080 keep that size.
+  The incoming drawing decoder remains 1920x1080. Frame rate and keyframe
+  settings are unchanged, and hosts supplying 1920x1080 keep that size.
+- `encoderBitRate` is exposed to Objective-C hosts, in bits/second, and must be
+  set on the owner queue before streaming starts. Its upstream default remains
+  1,920,000 bps; Ecamm now requests 480,000 bps for its 960x540 comparison.
+- The encoder's one-second burst limit now correctly converts bits to bytes:
+  `[Int64(bitRate) * 2 / 8, 1]`. At 480 kbps this requests a 120,000-byte limit
+  (960 kbps), twice the average. The old formula accidentally requested sixteen
+  times the average. Rejected average/limit settings are logged through the host.
 - `ShootCamera` uses the decoder's queue-confined parameter setter and explicit
   invalidation too, so shared decoder changes do not leave that caller behind.
 
@@ -73,8 +80,9 @@ the earlier attempts to change codec/network timing to cure that glitch.
 There is no custom 30-fps source scheduler, encoder submission window, decoder
 FIFO/submission window, compressed-frame replacement, send FIFO, keyframe
 resynchronization policy, forced flush, TCP_NODELAY change, or new frame-delay,
-bitrate, frame-rate, or keyframe-interval tuning. Original codec settings and
-ordered sends remain. Per-message limits are not a claim that all internal
+frame-rate, or keyframe-interval tuning. Apart from the explicit feed size and
+bitrate settings above, original codec settings and ordered sends remain.
+Per-message limits are not a claim that all internal
 Network/VideoToolbox queues have bounded total memory.
 
 There is no TLS or cryptographic device identity. Approval still trusts the

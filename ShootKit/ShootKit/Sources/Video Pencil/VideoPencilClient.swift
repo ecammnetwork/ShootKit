@@ -36,7 +36,8 @@ import CoreImage
     @Published var hasReceivedControlMessage = false
     @Published var mostRecentVideoSelection: String?
     @Published var latestCompressedSampleBuffer: CMSampleBuffer?
-    @Published var encoderBitRate: Int32 = 1920 * 1000
+    // Ecamm: Let the host choose bits/second before starting a stream; keep upstream's default.
+    @objc @Published public var encoderBitRate: Int32 = 1920 * 1000
     
     var ciContext: CIContext
     var referencePixelBuffer: CVPixelBuffer?
