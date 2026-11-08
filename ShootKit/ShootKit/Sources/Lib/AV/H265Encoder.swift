@@ -62,40 +62,26 @@ class H265Encoder {
         // Ecamm: A decoding capability check says nothing about encoding. Require
         // hardware at creation so the companion stream cannot silently use software.
         // Ecamm: Low-latency rate control is a creation option, not a session property.
-        // Try it for HEVC, but keep older/unsupported hardware working with one ordinary-hardware retry.
-        var specification: [CFString: Any] = [
-            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true,
-            kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true
-        ]
+        // Restore standard rate control for comparison after quality pulsing was reported in low-latency mode.
+        let specification = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
         let owner = Unmanaged.passRetained(self)
         callbackRetain = owner
         //create VTCompressionSession
-        // Ecamm: Share the creation call and retained callback owner across both attempts.
-        func createSession() -> OSStatus {
-            VTCompressionSessionCreate(
-                allocator: kCFAllocatorDefault,
-                width: width, height: height, codecType: codecType,
-                encoderSpecification: specification as CFDictionary,
-                imageBufferAttributes: nil,
-                compressedDataAllocator: nil,
-                outputCallback: encodeCallBack,
-                refcon:
+        // Ecamm: Keep the callback owner alive through this single hardware creation attempt.
+        let state = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: width, height: height, codecType: codecType,
+            encoderSpecification: specification,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: encodeCallBack,
+            refcon:
 //                unsafeBitCast(self, to: UnsafeMutableRawPointer.self),
-                    UnsafeMutableRawPointer(owner.toOpaque()),
-                compressionSessionOut: &self.encodeSession)
-        }
-        var state = createSession()
-        let lowLatencyAccepted = state == noErr && encodeSession != nil
-        if !lowLatencyAccepted {
-            // Ecamm: Tear down a partial result before retrying; neither attempt can use software.
-            if let session = encodeSession { VTCompressionSessionInvalidate(session) }
-            encodeSession = nil
-            delegate?.log(message: "Low-latency HEVC encoder creation failed: \(OSErrorCodeDescription(state)); retrying standard hardware rate control", color: .systemOrange)
-            specification.removeValue(forKey: kVTVideoEncoderSpecification_EnableLowLatencyRateControl)
-            state = createSession()
-        }
+                UnsafeMutableRawPointer(owner.toOpaque()),
+            compressionSessionOut: &self.encodeSession)
         
         if state != noErr || encodeSession == nil {
+            // Ecamm: Tear down a partial result before releasing its owner; there is no software retry.
             // Ecamm: Even an unsuccessful creation must not leave a session with a released refcon.
             if let session = encodeSession { VTCompressionSessionInvalidate(session) }
             encodeSession = nil
@@ -106,9 +92,7 @@ class H265Encoder {
         }
         
         guard let encodeSession = encodeSession else { return }
-        delegate?.log(message: lowLatencyAccepted
-            ? "HEVC encoder: low-latency rate control accepted at creation"
-            : "HEVC encoder: standard hardware rate control (low-latency fallback)", color: .systemGreen)
+        delegate?.log(message: "HEVC encoder: standard hardware rate control (low-latency disabled)", color: .systemGreen)
         
         //Set real-time encoding output
         VTSessionSetProperty(encodeSession, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -150,7 +134,8 @@ class H265Encoder {
         
         VTSessionSetProperty(encodeSession, key: kVTVideoEncoderList_IsHardwareAccelerated, value: kCFBooleanTrue)
 //        
-        // Ecamm: The former 11.3-guarded low-latency setter is now handled at session creation above.
+        // Ecamm: The former 11.3-guarded low-latency setter was a creation option, not a valid setter.
+        // Leave it unset at creation too, restoring the standard rate control used before the experiment.
         
 //        VTSessionSetProperty(encodeSession, key: kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, value: kCFBooleanTrue)
         

@@ -87,12 +87,20 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - The unused `CMTime: SliderValueType` camera-control conformance is restricted
   to macOS 13+, matching Apple's `CMTime: Hashable` availability. Video Pencil
   does not use this conformance, and its streaming API remains available on
-  Ecamm's macOS 12 minimum. The 11.3 low-latency creation option is available there;
-  the macOS 13 conformance guard is still needed on macOS 12.
+  Ecamm's macOS 12 minimum. The macOS 13 conformance guard is still needed on macOS 12.
 
-### Low-latency encoder configuration experiment
+### Low-latency encoder configuration experiment (reverted)
 
-- `EnableLowLatencyRateControl` is now passed in `encoderSpecification` to
+The creation-time low-latency option is now omitted again. After enabling it,
+the iPad showed new quality fluctuations without resolving the stutter. This
+rollback isolates that change for comparison; it does not claim the cause is
+proven. A single hardware-only creation attempt restores standard rate control.
+The log explicitly reports `standard hardware rate control (low-latency disabled)`.
+The old ineffective post-creation setter is not restored. Partial-session cleanup,
+encoder-mode logging, type-17/18 diagnostics, timestamps, bitrate, and all other
+codec settings remain. The following records the experiment for Michael:
+
+- `EnableLowLatencyRateControl` was passed in `encoderSpecification` to
   `VTCompressionSessionCreate`, as Apple documents, rather than sent to
   `VTSessionSetProperty` afterwards with its result ignored.
 - If creation fails, invalidate any partial session and retry once without that
@@ -144,7 +152,7 @@ There is no custom 30-fps source scheduler, encoder submission window, decoder
 FIFO/submission window, compressed-frame replacement, send FIFO, keyframe
 resynchronization policy, forced flush, TCP_NODELAY change, or experimental
 frame-rate/keyframe-interval tuning. Apart from Michael's upstream timestamp
-playout, the low-latency creation option, and the explicit feed size/bitrate settings above, original codec settings
+playout and the explicit feed size/bitrate settings above, original codec settings
 and ordered sends remain.
 Per-message limits are not a claim that all internal
 Network/VideoToolbox queues have bounded total memory.
