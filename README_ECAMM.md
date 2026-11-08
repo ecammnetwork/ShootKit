@@ -1,7 +1,9 @@
 # Ecamm's clean XPC integration branch
 
 This branch, `codex/ecamm-xpc`, starts at Michael's original ShootKit revision
-`5f83909083316e8c60b4b254844f03d6ccb5450d`. It is independent of the older
+`5f83909083316e8c60b4b254844f03d6ccb5450d` and now merges Michael's main through
+`361d3a81e6630a5eb6323f1542087cdfe8cbbb4f` (timestamp protocol, October 10, 2026).
+It is independent of the older
 `ecamm` branch and its experimental streaming changes. Changes below are marked
 with practical `Ecamm:` comments in the source to make upstream review easier.
 
@@ -15,6 +17,7 @@ the earlier attempts to change codec/network timing to cure that glitch.
 
 - Decoder compressed bytes are copied into Core Media-owned memory before
   decoding. The original block buffer referenced a temporary Swift array.
+  Michael now fixes this upstream; we use his implementation, not a second patch.
 - HEVC parameter pointers reference stable `NSData` owners kept alive through
   `CMVideoFormatDescriptionCreateFromHEVCParameterSets`.
 - Lazy/scaled `CIImage` inputs are rasterized into fresh pixel buffers rather
@@ -50,7 +53,8 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - Encoder creation requires hardware support through VideoToolbox's encoder
   specification (not a nonexistent hardware-encode query or a decode-capability
   check). A failed encoder is not recreated from every incoming frame.
-- Sample attachments are set before submitting the sample to VideoToolbox.
+- The old sample-attachment ordering fix is superseded: upstream removed the
+  ineffective decoder DisplayImmediately attachment. The host schedules output.
 
 ### Useful: Ecamm integration and diagnostics
 
@@ -78,15 +82,44 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - The unused `CMTime: SliderValueType` camera-control conformance is restricted
   to macOS 13+, matching Apple's `CMTime: Hashable` availability. Video Pencil
   does not use this conformance, and its streaming API remains available on
-  Ecamm's macOS 11.2 minimum. The optional 11.3 encoder setting stays guarded.
+  Ecamm's macOS 12 minimum. The optional 11.3 encoder setting remains guarded;
+  the macOS 13 conformance guard is still needed on macOS 12.
+
+### Upstream timestamps, with narrow input/lifecycle safeguards
+
+- Michael's encoder delegate carries the encoded sample's source PTS. Both peers
+  announce JSON capabilities (type 18); type 17 frames are sent only when the peer
+  advertises `acceptsVideoFrameHeaders`. Legacy peers continue to receive type 2.
+- The frame body is upstream's UInt32 little-endian JSON length, VideoFrameHeader
+  JSON, then HEVC. Optional duration/DTS are accepted; the current upstream encoder
+  emits only PTS. There is no Ecamm-private ECPTS1 wire extension in this fork.
+- Capability state resets on every stop/new connection, including replacement
+  after connection became nil. This prevents sending headers to an older peer.
+- Header parsing bounds JSON at 64 KiB and total payload at 16 MiB; validates
+  numeric epoch-zero times and finite ranges; rejects an empty compressed body.
+  Malformed headers report a decoder failure so the client restarts the prediction
+  chain rather than skipping compressed frames and corrupting later predictions.
+- RemoteClockMap is Michael's minimum-arrival-delay/drift-limited estimator with
+  its 70 ms cushion, not the earlier private experiment's fixed 250 ms mapping.
+  Arrival time is captured before queueing, while parsing/map/session state are
+  confined to the decoder queue. Parameter changes reset the map; backwards clocks
+  or large clock discontinuities re-anchor it. A warm-up estimate change cannot
+  schedule a newer frame before its predecessor.
+- Ecamm forwards the translated host-clock PTS across XPC. Its worker publishes
+  an owned drawing when due, with an eight-buffer bound and a generation guard
+  against post-disconnect drawings. The helper reply acknowledges the copy, not
+  the future display time. Nothing waits or schedules playback on the render thread.
+- The independent Mac test receiver now negotiates this same upstream wire format,
+  while retaining its diagnostic fixed 250 ms playback cushion.
 
 ## Deliberately excluded
 
 There is no custom 30-fps source scheduler, encoder submission window, decoder
 FIFO/submission window, compressed-frame replacement, send FIFO, keyframe
-resynchronization policy, forced flush, TCP_NODELAY change, or new frame-delay,
-frame-rate, or keyframe-interval tuning. Apart from the explicit feed size and
-bitrate settings above, original codec settings and ordered sends remain.
+resynchronization policy, forced flush, TCP_NODELAY change, or experimental
+frame-rate/keyframe-interval tuning. Apart from Michael's upstream timestamp
+playout and the explicit feed size/bitrate settings above, original codec settings
+and ordered sends remain.
 Per-message limits are not a claim that all internal
 Network/VideoToolbox queues have bounded total memory.
 

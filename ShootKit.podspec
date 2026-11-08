@@ -14,7 +14,8 @@ Pod::Spec.new do |s|
   s.author           = { 'Michael Forrest' => 'michael.forrest@gmail.com' }
   s.source           = { :git => 'https://github.com/goodtohear/ShootKit.git', :tag => s.version.to_s }
 
-  s.osx.deployment_target = '11.0'
+  # Ecamm's helper now shares the app's macOS 12 minimum.
+  s.osx.deployment_target = '12.0'
   s.swift_versions        = ['5.0']
 
   s.source_files = 'ShootKit/ShootKit/Sources/**/*.swift'

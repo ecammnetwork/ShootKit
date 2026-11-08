@@ -156,6 +156,8 @@ import CoreImage
     }
 
     private func connectTo_iPad(at networkBrowserResult: NWBrowser.Result){
+        // Ecamm: A new peer must negotiate its own capabilities, even after stop() cleared connection.
+        capabilitiesReceivedFromPeer = nil // the next connection may be to a different version
         if connection != nil {
             log(message: "Removing existing Video Pencil connection", color: .systemOrange)
             connection?.cancel()
@@ -193,6 +195,11 @@ import CoreImage
         switch(newState){
         case .ready:
             log(message: "Video Pencil connection ready, awaiting message", color: .systemMint)
+            if let data = try? JSONEncoder().encode(PeerCapabilities(acceptsVideoFrameHeaders: true)) {
+                let message = NWProtocolFramer.Message(videoMessageType: .capabilities)
+                let context = NWConnection.ContentContext(identifier: "capabilities", metadata: [message])
+                connection.send(content: data, contentContext: context, isComplete: true, completion: .idempotent)
+            }
             notifiedConnected = true
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -298,6 +305,14 @@ import CoreImage
                 case .videoFrame:
                     // received pencil layer
                     self.decode(frame: frame)
+                case .videoFrameWithHeader:
+                    self.createDecoderIfNeeded()
+                    self.decoder?.decodeFrameWithHeader(frame)
+                case .capabilities:
+                    // Ecamm: Capability JSON is tiny; bound parsing work from an untrusted peer.
+                    if frame.count <= 64 * 1024 {
+                        self.capabilitiesReceivedFromPeer = try? JSONDecoder().decode(PeerCapabilities.self, from: frame)
+                    }
                     
                 case .invalid, .cameraAvailable, .handshake:
                     break
@@ -319,6 +334,8 @@ import CoreImage
         send(basicMessage: message)
     }
     
+    /// What Video Pencil has told us it can receive. Nil until its capabilities message arrives.
+    var capabilitiesReceivedFromPeer: PeerCapabilities?
     var decoder: H265Decoder?
     func createDecoderIfNeeded(){
         if decoder == nil {
@@ -382,6 +399,8 @@ import CoreImage
         connection?.viabilityUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        // Ecamm: Do not carry timestamp support into a later legacy connection.
+        capabilitiesReceivedFromPeer = nil
         cancelVideoStream()
         decoder?.invalidate()
         decoder = nil
@@ -465,7 +484,7 @@ extension VideoPencilClient: H265EncoderDelegate{
         // completion, so the initial keyframe is never discarded while parameters send.
         hasSentParameterSet = true
     }
-    func videoEncoderDidYieldVideoData(_ encoder: H265Encoder, compressedVideo data: Data) {
+    func videoEncoderDidYieldVideoData(_ encoder: H265Encoder, compressedVideo data: Data, presentationTimeStamp: CMTime) {
         guard encoder === self.encoder, let connection = connection, hasSentParameterSet else {
             log("VideoPencilClient Ignoring frame, no keyframe received yet", color: .orange)
             return
@@ -477,10 +496,18 @@ extension VideoPencilClient: H265EncoderDelegate{
         let packetSize = connection.maximumDatagramSize - 40
         guard packetSize > 0 else { return }
         
-        let message = NWProtocolFramer.Message(videoMessageType: .videoFrame)
+        var payload = data
+        var messageType = VideoMessageType.videoFrame
+        // Plain frames unless the peer has said it accepts headers: older versions ignore message type 17.
+        if capabilitiesReceivedFromPeer?.acceptsVideoFrameHeaders == true,
+           let payloadWithHeader = try? VideoFrameHeader.payload(compressedVideoFrame: data, presentationTimeStamp: presentationTimeStamp) {
+            payload = payloadWithHeader
+            messageType = .videoFrameWithHeader
+        }
+        let message = NWProtocolFramer.Message(videoMessageType: messageType)
         let context = NWConnection.ContentContext(identifier: "videoFrame", metadata: [message])
 //        log(message: "Sending everything in one go", color: .systemGreen)
-        connection.send(content: data, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self] error in
+        connection.send(content: payload, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self] error in
             if let error = error {
                 self?.log(message: "Error sending encoded video:" + error.debugDescription, color: .red)
 

@@ -32,6 +32,9 @@ class H265Decoder {
     @Published var totalBytesDecoded: Int = 0
     
     var decompressionSession : VTDecompressionSession?
+
+    /// Converts the sender's timestamps to this Mac's host clock.
+    let remoteClockMap = RemoteClockMap()
     var callback : VTDecompressionOutputCallback?
     
     var pixelBufferPool: CVPixelBufferPool?
@@ -55,6 +58,8 @@ class H265Decoder {
                 self.decodeDesc = nil
             }
             self.parameterSet = parameters
+            // Ecamm: Parameter messages start a new stream, possibly with a new clock origin.
+            self.remoteClockMap.reset()
             DispatchQueue.main.async { [weak self] in self?.parameterSetView = parameters }
         }
     }
@@ -199,14 +204,16 @@ class H265Decoder {
 
                 guard status == noErr else {
                     delegate.log(message: "Decoding error: Image buffer creation failed - \(ErrorCodeLookup[status] ?? "\(status)")", color: .red)
-                    decoder.callBackQueue.async {
-                        delegate.videoDecoder(decoder, failedWith: status)
+                    decoder.callBackQueue.async {[weak delegate, weak decoder] in
+                        guard let decoder else { return }
+                        delegate?.videoDecoder(decoder, failedWith: status)
                     }
                     return
                 }
                 // Ecamm: A successful dropped frame is not a damaged stream.
                 guard !inforFlags.contains(.frameDropped), let imageBuffer else { return }
-                decoder.callBackQueue.async {
+                decoder.callBackQueue.async { [weak delegate, weak decoder] in
+                    guard let delegate, let decoder else { return }
                     delegate.videoDecoderDidDecodePixelBuffer(decoder, pixelBuffer: imageBuffer, presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
                 }
             }
@@ -222,19 +229,40 @@ class H265Decoder {
             self.decodeByte(data: data, size: length)
         }
     }
-    private func decodeByte(data:Data,size:UInt32) {
+    /// Decodes a videoFrameWithHeader message. The timestamp handed to the delegate is the time
+    /// on this Mac's host clock at which the frame should be displayed.
+    func decodeFrameWithHeader(_ payload: Data) {
+        // Consult the clock map using arrival time, not the time spent waiting on the decode queue.
+        // Ecamm: Capture arrival now, but serialize parsing/mapping with parameter changes and teardown.
+        let arrival = CMClockGetTime(CMClockGetHostTimeClock())
+        decodeQueue.async { [weak self] in
+            guard let self, !self.invalidated else { return }
+            guard let (header, compressedFrame) = try? VideoFrameHeader.parse(payload) else {
+                // Ecamm: Reset the prediction chain instead of silently discarding a compressed frame.
+                self.callBackQueue.async { [weak self] in
+                    guard let self else { return }
+                    self.delegate?.videoDecoder(self, failedWith: kVTVideoDecoderBadDataErr)
+                }
+                return
+            }
+            let displayTime = self.remoteClockMap.displayHostTime(
+                forSenderPresentationTimeStamp: header.presentationTimeStamp, arrivalHostTime: arrival)
+            self.decodeByte(data: compressedFrame, size: UInt32(compressedFrame.count), displayTime: displayTime, duration: header.duration ?? .invalid)
+        }
+    }
+
+    private func decodeByte(data:Data,size:UInt32, displayTime: CMTime = .invalid, duration: CMTime = .invalid) {
         if parameterSet == nil {
             return
         }
         if initDecoder(){
-            decode(frame: [UInt8](data), size: size)
+            decode(frame: [UInt8](data), size: size, displayTime: displayTime, duration: duration)
         }
     }
     
-    private func decode(frame:[UInt8],size:UInt32) {
+    private func decode(frame:[UInt8],size:UInt32, displayTime: CMTime, duration: CMTime) {
         //
         var blockBuffer: CMBlockBuffer?
-        var frame1 = frame
         //        var memoryBlock = frame1.withUnsafeMutableBytes({$0}).baseAddress
         //        var ddd = Data(bytes: frame, count: Int(size))
         //Create blockBuffer
@@ -256,7 +284,7 @@ class H265Decoder {
                                                             customBlockSource: nil,
                                                             offsetToData:0,
                                                             dataLength: Int(size),
-                                                            flags: 0,
+                                                            flags: kCMBlockBufferAssureMemoryNowFlag,
                                                             blockBufferOut: &blockBuffer)
         if blockState != noErr {
             self.delegate?.log(message: "Failed to create blockBuffer \(OSErrorCodeDescription(blockState))", color: .red)
@@ -264,13 +292,14 @@ class H265Decoder {
         }
         // Ecamm: Core Media owns this copy for the full asynchronous decode lifetime.
         // Referencing frame1 with kCFAllocatorNull allowed its temporary bytes to expire.
-        guard let blockBuffer else { return }
-        let copyState = frame1.withUnsafeBytes { bytes in
-            CMBlockBufferReplaceDataBytes(with: bytes.baseAddress!, blockBuffer: blockBuffer,
-                                         offsetIntoDestination: 0, dataLength: Int(size))
-        }
-        guard copyState == noErr else { return }
         //
+        // Copy the bytes into memory the block buffer owns, so they stay valid for as long as the decoder needs them.
+        let copyState = CMBlockBufferReplaceDataBytes(with: frame, blockBuffer: blockBuffer!, offsetIntoDestination: 0, dataLength: Int(size))
+        if copyState != noErr {
+            self.delegate?.log(message: "Failed to copy frame into blockBuffer \(OSErrorCodeDescription(copyState))", color: .red)
+            return
+        }
+        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: displayTime, decodeTimeStamp: .invalid)
         var sampleSizeArray :[Int] = [Int(size)]
         var sampleBuffer :CMSampleBuffer?
         //Create sampleBuffer
@@ -289,8 +318,8 @@ class H265Decoder {
                                                    dataBuffer: blockBuffer,
                                                    formatDescription: decodeDesc,
                                                    sampleCount: CMItemCount(1),
-                                                   sampleTimingEntryCount: CMItemCount(),
-                                                   sampleTimingArray: nil,
+                                                   sampleTimingEntryCount: CMItemCount(1),
+                                                   sampleTimingArray: &timing,
                                                    sampleSizeEntryCount: CMItemCount(1),
                                                    sampleSizeArray: &sampleSizeArray,
                                                    sampleBufferOut: &sampleBuffer)
@@ -300,14 +329,8 @@ class H265Decoder {
         }
         
         guard let decompressionSession = self.decompressionSession, let sampleBuffer = sampleBuffer else { return }
-        // Ecamm: Set attachments before asynchronous submission, not while decoding runs.
-        let attachments:CFArray? = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true)
-        if let attachmentArray = attachments, CFArrayGetCount(attachmentArray) > 0 {
-            let dic = unsafeBitCast(CFArrayGetValueAtIndex(attachmentArray, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dic,
-                                 Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
+        // Ecamm: Attachments would need setting before asynchronous submission, not while decoding runs.
+        // Upstream now omits DisplayImmediately; the host schedules decoded frames using the mapped PTS.
         //Decode data
         /*
          Parameter 1: Decoding session
