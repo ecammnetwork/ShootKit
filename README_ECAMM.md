@@ -33,7 +33,12 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - `disconnect()` suppresses automatic reconnection until the host explicitly
   calls `reconnect()`. Ecamm uses this for sleep and user switching. Device-specific
   revocation uses `refreshPermissions(forDeviceIdentifier:allowed:)` so another
-  approved iPad remains discoverable without reprompting for the revoked row.
+  approved iPad remains discoverable. Removing a row now stops its stream and
+  immediately requests fresh approval for that iPad if it remains available.
+  This is an intentional change from suppressing the removed name until restart.
+  The refreshed device takes priority over other candidates, but still goes through
+  the host's permission delegate before TCP/video. Don't Allow still suppresses
+  repeated prompts, and refresh never overrides sleep/user-switch disconnection.
 - Discovery selects a stable eligible Bonjour name, skips declined names for the
   session, and advances after denial or disappearance during approval. Explicit
   reconnect/permission refresh rechecks eligibility; name-based trust is unchanged.

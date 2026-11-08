@@ -13,11 +13,13 @@ import CoreImage
 
 // Ecamm: Stable selection lets a declined or vanished iPad yield to other available devices.
 // Kept independent of NWBrowser so the policy can be checked without Bonjour traffic.
-func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: Set<String>) -> NWEndpoint? {
-    endpoints.compactMap { endpoint -> (NWEndpoint, String)? in
+func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: Set<String>, preferredName: String? = nil) -> NWEndpoint? {
+    let candidates = endpoints.compactMap { endpoint -> (NWEndpoint, String)? in
         guard case let .service(name, _, _, _) = endpoint, !deniedNames.contains(name) else { return nil }
         return (endpoint, name)
-    }.sorted { $0.1 < $1.1 }.first?.0
+    }.sorted { $0.1 < $1.1 }
+    // Ecamm: Recheck the explicitly removed device first, rather than switching to another iPad.
+    return candidates.first(where: { $0.1 == preferredName })?.0 ?? candidates.first?.0
 }
 
 @objc public protocol VideoPencilClientDelegate: AnyObject{
@@ -124,10 +126,10 @@ func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: 
     }
     
 
-    func start(){
+    func start(preferredDeviceIdentifier: String? = nil){
         guard !explicitlyStopped, connection == nil else { return }
         let results = bonjourBrowser.browseResults
-        if let endpoint = nextVideoPencilEndpoint(in: results.map(\.endpoint), excluding: deniedDeviceNames),
+        if let endpoint = nextVideoPencilEndpoint(in: results.map(\.endpoint), excluding: deniedDeviceNames, preferredName: preferredDeviceIdentifier),
            let result = results.first(where: { $0.endpoint == endpoint }) {
             connectIfAuthorized(to: result)
         }
@@ -484,15 +486,15 @@ func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: 
 
     @objc public func refreshPermissions(forDeviceIdentifier identifier: String, allowed: Bool) {
         // Ecamm: Revoking one iPad must not stop discovery of other approved devices.
-        // Recheck other previously denied devices, but do not immediately reprompt for the revoked row.
+        // Recheck previously denied devices too. Removing a row now requests fresh approval immediately;
+        // it is not a denial. A subsequent Don't Allow decision still suppresses repeated prompts.
         queue.async { [weak self] in
             guard let self else { return }
             self.deniedDeviceNames.removeAll()
             if !allowed {
-                self.deniedDeviceNames.insert(identifier)
                 if self.remoteDeviceIdentifier == identifier { self.stop() }
             }
-            self.start() // Explicit sleep/user-switch disconnects still suppress this.
+            self.start(preferredDeviceIdentifier: identifier) // Explicit sleep/user-switch disconnects still suppress this.
         }
     }
 
