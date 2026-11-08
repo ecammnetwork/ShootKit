@@ -61,6 +61,11 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - `logHandler` forwards diagnostics to the host. Ecamm relays these across XPC
   into `EcammLog` using `VideoPencil:`. Without a handler, the fallback also uses
   `VideoPencil:` rather than the colored-square emoji.
+- Connection diagnostics now report our type-18 advertisement, the peer's parsed
+  timestamp capability (including an absent flag or invalid JSON), and the actual
+  outgoing-video/incoming-drawing wire types: 17 for timestamps, 2 for legacy.
+  Repeated capabilities/frame types are silent; reconnects and mode changes log
+  again. This establishes protocol use, not the iPad's actual playback behavior.
 - An optional streaming-state callback lets Ecamm stop preparing source frames
   when the iPad cancels its stream, even if the TCP connection remains open.
 - Decoder output is IOSurface-backed for the helper's cross-process handoff.
@@ -82,8 +87,29 @@ the earlier attempts to change codec/network timing to cure that glitch.
 - The unused `CMTime: SliderValueType` camera-control conformance is restricted
   to macOS 13+, matching Apple's `CMTime: Hashable` availability. Video Pencil
   does not use this conformance, and its streaming API remains available on
-  Ecamm's macOS 12 minimum. The optional 11.3 encoder setting remains guarded;
+  Ecamm's macOS 12 minimum. The 11.3 low-latency creation option is available there;
   the macOS 13 conformance guard is still needed on macOS 12.
+
+### Low-latency encoder configuration experiment
+
+- `EnableLowLatencyRateControl` is now passed in `encoderSpecification` to
+  `VTCompressionSessionCreate`, as Apple documents, rather than sent to
+  `VTSessionSetProperty` afterwards with its result ignored.
+- If creation fails, invalidate any partial session and retry once without that
+  option. Both attempts require hardware HEVC; there is no software fallback.
+  The same retained callback owner remains alive through creation/teardown, and
+  a final failure releases it. No new retries occur in the per-frame path.
+- The log states whether creation accepted low-latency rate control or required
+  the standard-hardware fallback, including the original failure status.
+- This is a bounded experiment for encoding delay/variation, not a claim that
+  iPad playback stutter is fixed. Keyframe interval (30), requested frame rate,
+  960x540 feed, 900 kbps average, 3x burst cap, timestamp buffering, and send order
+  remain unchanged. Initialization and logging stay inside the XPC helper.
+- On the tested Apple Silicon Mac, low-latency creation and both bitrate setters
+  succeed, and encoded frames preserve source PTS. DataRateLimits readback returns
+  `kVTPropertyNotSupportedErr` in this mode, so the diagnostic reports that limitation
+  rather than claiming it measured an enforced burst ceiling. It still rejects
+  setter failures and unexpected readback errors.
 
 ### Upstream timestamps, with narrow input/lifecycle safeguards
 
@@ -118,7 +144,7 @@ There is no custom 30-fps source scheduler, encoder submission window, decoder
 FIFO/submission window, compressed-frame replacement, send FIFO, keyframe
 resynchronization policy, forced flush, TCP_NODELAY change, or experimental
 frame-rate/keyframe-interval tuning. Apart from Michael's upstream timestamp
-playout and the explicit feed size/bitrate settings above, original codec settings
+playout, the low-latency creation option, and the explicit feed size/bitrate settings above, original codec settings
 and ordered sends remain.
 Per-message limits are not a claim that all internal
 Network/VideoToolbox queues have bounded total memory.

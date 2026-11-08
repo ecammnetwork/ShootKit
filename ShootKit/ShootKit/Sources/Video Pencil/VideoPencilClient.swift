@@ -59,6 +59,10 @@ import CoreImage
     private var notifiedConnected = false
     private var reconnectPending = false
     private var explicitlyStopped = false
+    // Ecamm: Log negotiation and actual wire modes on this owner queue, not for every frame.
+    private var lastLoggedPeerSupport: String?
+    private var lastSentVideoType: VideoMessageType?
+    private var lastReceivedVideoType: VideoMessageType?
     
     public var hasConnection: Bool{
         connection != nil
@@ -158,6 +162,9 @@ import CoreImage
     private func connectTo_iPad(at networkBrowserResult: NWBrowser.Result){
         // Ecamm: A new peer must negotiate its own capabilities, even after stop() cleared connection.
         capabilitiesReceivedFromPeer = nil // the next connection may be to a different version
+        lastLoggedPeerSupport = nil
+        lastSentVideoType = nil
+        lastReceivedVideoType = nil
         if connection != nil {
             log(message: "Removing existing Video Pencil connection", color: .systemOrange)
             connection?.cancel()
@@ -199,6 +206,7 @@ import CoreImage
                 let message = NWProtocolFramer.Message(videoMessageType: .capabilities)
                 let context = NWConnection.ContentContext(identifier: "capabilities", metadata: [message])
                 connection.send(content: data, contentContext: context, isComplete: true, completion: .idempotent)
+                log(message: "Advertised timestamp support (type 18); awaiting peer capabilities", color: .systemMint)
             }
             notifiedConnected = true
             DispatchQueue.main.async { [weak self] in
@@ -304,14 +312,24 @@ import CoreImage
                 
                 case .videoFrame:
                     // received pencil layer
+                    self.logVideoType(.videoFrame, sending: false)
                     self.decode(frame: frame)
                 case .videoFrameWithHeader:
+                    self.logVideoType(.videoFrameWithHeader, sending: false)
                     self.createDecoderIfNeeded()
                     self.decoder?.decodeFrameWithHeader(frame)
                 case .capabilities:
                     // Ecamm: Capability JSON is tiny; bound parsing work from an untrusted peer.
                     if frame.count <= 64 * 1024 {
                         self.capabilitiesReceivedFromPeer = try? JSONDecoder().decode(PeerCapabilities.self, from: frame)
+                        // Ecamm: Distinguish an explicit no from an absent flag or invalid JSON.
+                        let support = self.capabilitiesReceivedFromPeer.map {
+                            $0.acceptsVideoFrameHeaders.map { $0 ? "yes" : "no" } ?? "not advertised"
+                        } ?? "invalid capabilities"
+                        if self.lastLoggedPeerSupport != support {
+                            self.lastLoggedPeerSupport = support
+                            self.log(message: "Peer capabilities (type 18): accepts timestamped frames = \(support)", color: .systemMint)
+                        }
                     }
                     
                 case .invalid, .cameraAvailable, .handshake:
@@ -332,6 +350,20 @@ import CoreImage
     func send(controlMessage: VideoPencilControlMessage){
         let message = BasicControlMessage(command: controlMessage)
         send(basicMessage: message)
+    }
+
+    private func logVideoType(_ type: VideoMessageType, sending: Bool) {
+        // Ecamm: A peer can negotiate after streaming starts; report a mode change once per direction.
+        if sending {
+            guard lastSentVideoType != type else { return }
+            lastSentVideoType = type
+        } else {
+            guard lastReceivedVideoType != type else { return }
+            lastReceivedVideoType = type
+        }
+        let direction = sending ? "Sending video" : "Receiving drawing"
+        let mode = type == .videoFrameWithHeader ? "timestamped" : "legacy, no timestamps"
+        log(message: "\(direction): type \(type.rawValue) (\(mode))", color: .systemMint)
     }
     
     /// What Video Pencil has told us it can receive. Nil until its capabilities message arrives.
@@ -504,6 +536,7 @@ extension VideoPencilClient: H265EncoderDelegate{
             payload = payloadWithHeader
             messageType = .videoFrameWithHeader
         }
+        logVideoType(messageType, sending: true)
         let message = NWProtocolFramer.Message(videoMessageType: messageType)
         let context = NWConnection.ContentContext(identifier: "videoFrame", metadata: [message])
 //        log(message: "Sending everything in one go", color: .systemGreen)
