@@ -22,6 +22,7 @@ class H265Decoder {
     
     var decodeQueue = DispatchQueue(label: "decode") // both serial queues
     var callBackQueue:DispatchQueue
+    private let workMonitor: VideoWorkMonitor
     var decodeDesc : CMVideoFormatDescription?
     
     // Ecamm: All session and parameter state belongs to decodeQueue.
@@ -42,7 +43,8 @@ class H265Decoder {
 
     
     
-    public init( width: Int32, height: Int32, callbackQueue: DispatchQueue) {
+    public init( width: Int32, height: Int32, callbackQueue: DispatchQueue, workMonitor: VideoWorkMonitor = VideoWorkMonitor()) {
+        self.workMonitor = workMonitor
         self.width = width
         self.height = height
         self.callBackQueue = callbackQueue
@@ -50,11 +52,15 @@ class H265Decoder {
 
     func setParameterSet(_ parameters: [Data]) {
         // Ecamm: Network callbacks must not race the decoder's Array reads.
+        let monitor = workMonitor
+        guard let token = beginDecode(bytes: parameters.reduce(0, { $0 + $1.count })) else { return }
         decodeQueue.async { [weak self] in
+            defer { monitor.finish(token) }
             guard let self, !self.invalidated else { return }
             if self.parameterSet != parameters, let session = self.decompressionSession {
                 VTDecompressionSessionInvalidate(session)
                 self.decompressionSession = nil
+                self.workMonitor.finishInvalidatedCodec(self, includingQueued: false)
                 self.decodeDesc = nil
             }
             self.parameterSet = parameters
@@ -199,6 +205,11 @@ class H265Decoder {
             let decoder : H265Decoder =
                 //unsafeBitCast(decompressionOutputRefCon, to: H265Decoder.self)
              Unmanaged<H265Decoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
+            // Ecamm: Include decoded images waiting on the delivery queue in the safety cap.
+            let monitor = decoder.workMonitor
+            let token = UInt(bitPattern: sourceFrameRefCon)
+            var handedOff = false
+            defer { if !handedOff { monitor.finish(token) } }
 
             if let delegate = decoder.delegate  {
 
@@ -212,7 +223,9 @@ class H265Decoder {
                 }
                 // Ecamm: A successful dropped frame is not a damaged stream.
                 guard !inforFlags.contains(.frameDropped), let imageBuffer else { return }
+                handedOff = true
                 decoder.callBackQueue.async { [weak delegate, weak decoder] in
+                    defer { monitor.finish(token) }
                     guard let delegate, let decoder else { return }
                     delegate.videoDecoderDidDecodePixelBuffer(decoder, pixelBuffer: imageBuffer, presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
                 }
@@ -222,11 +235,13 @@ class H265Decoder {
     func decode(_ data: Data) {
         // Ecamm: The shared decoder can also receive data without the network framer.
         guard !data.isEmpty, data.count <= VideoProtocol.maximumMessageLength else { return }
+        let monitor = workMonitor
+        guard let token = beginDecode(bytes: data.count) else { return }
         decodeQueue.async {[weak self] in
-            guard let self = self, !self.invalidated else { return }
+            guard let self = self, !self.invalidated else { monitor.finish(token); return }
             let length:UInt32 =  UInt32(data.count)
 //            self.delegate?.log(message: "will decode \(data)")
-            self.decodeByte(data: data, size: length)
+            self.decodeByte(data: data, size: length, token: token)
         }
     }
     /// Decodes a videoFrameWithHeader message. The timestamp handed to the delegate is the time
@@ -235,9 +250,12 @@ class H265Decoder {
         // Consult the clock map using arrival time, not the time spent waiting on the decode queue.
         // Ecamm: Capture arrival now, but serialize parsing/mapping with parameter changes and teardown.
         let arrival = CMClockGetTime(CMClockGetHostTimeClock())
+        let monitor = workMonitor
+        guard let token = beginDecode(bytes: payload.count) else { return }
         decodeQueue.async { [weak self] in
-            guard let self, !self.invalidated else { return }
+            guard let self, !self.invalidated else { monitor.finish(token); return }
             guard let (header, compressedFrame) = try? VideoFrameHeader.parse(payload) else {
+                monitor.finish(token)
                 // Ecamm: Reset the prediction chain instead of silently discarding a compressed frame.
                 self.callBackQueue.async { [weak self] in
                     guard let self else { return }
@@ -247,20 +265,38 @@ class H265Decoder {
             }
             let displayTime = self.remoteClockMap.displayHostTime(
                 forSenderPresentationTimeStamp: header.presentationTimeStamp, arrivalHostTime: arrival)
-            self.decodeByte(data: compressedFrame, size: UInt32(compressedFrame.count), displayTime: displayTime, duration: header.duration ?? .invalid)
+            self.decodeByte(data: compressedFrame, size: UInt32(compressedFrame.count), token: token, displayTime: displayTime, duration: header.duration ?? .invalid)
         }
     }
 
-    private func decodeByte(data:Data,size:UInt32, displayTime: CMTime = .invalid, duration: CMTime = .invalid) {
+    private func beginDecode(bytes: Int) -> UInt? {
+        // Ecamm: Overload resets the whole stream. Dropping one compressed frame corrupts later frames.
+        guard let token = workMonitor.begin(.decode, bytes: bytes, owner: self) else {
+            callBackQueue.async { [weak self] in
+                guard let self else { return }
+                self.delegate?.videoDecoder(self, failedWith: kVTVideoDecoderBadDataErr)
+            }
+            return nil
+        }
+        return token
+    }
+
+    private func decodeByte(data:Data,size:UInt32, token: UInt, displayTime: CMTime = .invalid, duration: CMTime = .invalid) {
         if parameterSet == nil {
+            workMonitor.finish(token)
             return
         }
         if initDecoder(){
-            decode(frame: [UInt8](data), size: size, displayTime: displayTime, duration: duration)
+            decode(frame: [UInt8](data), size: size, token: token, displayTime: displayTime, duration: duration)
+        } else {
+            workMonitor.finish(token)
         }
     }
     
-    private func decode(frame:[UInt8],size:UInt32, displayTime: CMTime, duration: CMTime) {
+    private func decode(frame:[UInt8],size:UInt32, token: UInt, displayTime: CMTime, duration: CMTime) {
+        // Ecamm: Every early failure releases its admission; accepted frames finish in the callback.
+        var submitted = false
+        defer { if !submitted { workMonitor.finish(token) } }
         //
         var blockBuffer: CMBlockBuffer?
         //        var memoryBlock = frame1.withUnsafeMutableBytes({$0}).baseAddress
@@ -339,8 +375,9 @@ class H265Decoder {
          Parameter 4: decoded data outputPixelBuffer
          Parameter 5: Synchronous/asynchronous decoding identification
          */
-        let sourceFrame:UnsafeMutableRawPointer? = nil
+        let sourceFrame = UnsafeMutableRawPointer(bitPattern: token)
         var inforFalg = VTDecodeInfoFlags.asynchronous
+        workMonitor.submitted(token)
         let decodeState = VTDecompressionSessionDecodeFrame(
             decompressionSession,
             sampleBuffer: sampleBuffer,
@@ -348,6 +385,7 @@ class H265Decoder {
             frameRefcon: sourceFrame,
             infoFlagsOut: &inforFalg
         )
+        submitted = decodeState == noErr && !inforFalg.contains(.frameDropped)
         if decodeState != noErr {
             delegate?.log(message: "Decoding failed for \(decompressionSession) \(OSErrorCodeDescription(decodeState))", color: .red)
             // Ecamm: Let the owner reset the whole prediction chain after real errors.
@@ -368,12 +406,15 @@ class H265Decoder {
     func invalidate() {
         // Ecamm: Keep the callback owner alive until VideoToolbox is invalidated.
         // Teardown is ordered after submissions and never waits on the calling thread.
+        let token = workMonitor.begin(.teardown)
         decodeQueue.async { [self] in
+            defer { if let token { workMonitor.finish(token) } }
             invalidated = true
             if let session = decompressionSession {
                 VTDecompressionSessionInvalidate(session)
                 decompressionSession = nil
             }
+            workMonitor.finishInvalidatedCodec(self)
         }
     }
     

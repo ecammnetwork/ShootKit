@@ -34,6 +34,7 @@ class H265Encoder {
     
     private var encodeQueue = DispatchQueue(label: "encode")
     private var callBackQueue: DispatchQueue
+    private let workMonitor: VideoWorkMonitor
     
     var encodeSession:VTCompressionSession?
     var encodeCallBack:VTCompressionOutputCallback?
@@ -44,7 +45,8 @@ class H265Encoder {
     private var extractedParameterSet = false
     var isReady: Bool { encodeSession != nil }
     
-    init(codecType: CMVideoCodecType = kCMVideoCodecType_HEVC, width:Int32, height:Int32, bitRate : Int32?, fps: Int32?, callbackQueue: DispatchQueue, delegate: H265EncoderDelegate? = nil) {
+    init(codecType: CMVideoCodecType = kCMVideoCodecType_HEVC, width:Int32, height:Int32, bitRate : Int32?, fps: Int32?, callbackQueue: DispatchQueue, delegate: H265EncoderDelegate? = nil, workMonitor: VideoWorkMonitor = VideoWorkMonitor()) {
+        self.workMonitor = workMonitor
         self.codecType = codecType
         self.width = width
         self.height = height
@@ -148,6 +150,11 @@ class H265Encoder {
             let encoder : H265Encoder =
                  Unmanaged<H265Encoder>.fromOpaque(outputCallbackRefCon).takeUnretainedValue()
             let callBackQueue = encoder.callBackQueue
+            // Ecamm: Count the frame until delivery, not just until VideoToolbox accepts it.
+            let monitor = encoder.workMonitor
+            let token = UInt(bitPattern: sourceFrameRefCon)
+            var handedOff = false
+            defer { if !handedOff { monitor.finish(token) } }
 
             // Ecamm: Report actual failures, but a successful frame drop needs no restart.
             guard status == noErr else {
@@ -213,7 +220,9 @@ class H265Encoder {
             let byteCount = data.count
             
             let presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            handedOff = true
             callBackQueue.async { [weak encoder] in
+                defer { monitor.finish(token) }
                 if let encoder = encoder{
                     encoder.delegate?.videoEncoderDidYieldVideoData(encoder, compressedVideo: data, presentationTimeStamp: presentationTimeStamp)
                     encoder.addToTotal(bytes: byteCount)
@@ -227,10 +236,17 @@ class H265Encoder {
     //Start coding
     func encode(pixelBuffer:CVPixelBuffer, presentationTimeStamp:CMTime, duration:CMTime){
         // Ecamm: A failed/cancelled session is not recreated from the frame path.
+        // Only unsubmitted raw frames may be skipped; never drop an encoded prediction frame.
+        let monitor = workMonitor
+        guard let token = monitor.begin(.encode, owner: self) else { return }
         encodeQueue.async {[weak self] in
-            guard let self = self, !self.invalidated, let encodeSession = self.encodeSession else { return }
+            guard let self = self, !self.invalidated, let encodeSession = self.encodeSession else {
+                monitor.finish(token)
+                return
+            }
             var flags: VTEncodeInfoFlags = VTEncodeInfoFlags()
-            let state = VTCompressionSessionEncodeFrame(encodeSession, imageBuffer: pixelBuffer, presentationTimeStamp: presentationTimeStamp, duration: duration, frameProperties: nil, sourceFrameRefcon: nil, infoFlagsOut: &flags)
+            let state = VTCompressionSessionEncodeFrame(encodeSession, imageBuffer: pixelBuffer, presentationTimeStamp: presentationTimeStamp, duration: duration, frameProperties: nil, sourceFrameRefcon: UnsafeMutableRawPointer(bitPattern: token), infoFlagsOut: &flags)
+            if state != noErr || flags.contains(.frameDropped) { monitor.finish(token) }
             if state != noErr{
                 callBackQueue.async{
                     self.delegate?.log(message: "encode failure \(OSErrorCodeDescription(state))", color: .red)
@@ -244,13 +260,16 @@ class H265Encoder {
     func invalidate() {
         // Ecamm: Serialize teardown behind submissions. No UI/render caller waits
         // for VideoToolbox, and the C refcon stays valid through the last callback.
+        let token = workMonitor.begin(.teardown)
         encodeQueue.async { [self] in
+            defer { if let token { workMonitor.finish(token) } }
             guard !invalidated else { return }
             invalidated = true
             if let session = encodeSession {
                 VTCompressionSessionInvalidate(session)
                 encodeSession = nil
             }
+            workMonitor.finishInvalidatedCodec(self)
             callbackRetain?.release()
             callbackRetain = nil
         }

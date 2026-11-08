@@ -11,6 +11,15 @@ import VideoToolbox
 import AppKit
 import CoreImage
 
+// Ecamm: Stable selection lets a declined or vanished iPad yield to other available devices.
+// Kept independent of NWBrowser so the policy can be checked without Bonjour traffic.
+func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: Set<String>) -> NWEndpoint? {
+    endpoints.compactMap { endpoint -> (NWEndpoint, String)? in
+        guard case let .service(name, _, _, _) = endpoint, !deniedNames.contains(name) else { return nil }
+        return (endpoint, name)
+    }.sorted { $0.1 < $1.1 }.first?.0
+}
+
 @objc public protocol VideoPencilClientDelegate: AnyObject{
     func videoPencilDidConnect(_ client: VideoPencilClient)
     func videoPencilDidDisconnect(_ client: VideoPencilClient)
@@ -39,7 +48,18 @@ import CoreImage
     // Ecamm: Let the host choose bits/second before starting a stream; keep upstream's default.
     @objc @Published public var encoderBitRate: Int32 = 1920 * 1000
     
-    var ciContext: CIContext
+    // Ecamm: Discovery and direct pixel-buffer sends need no extra Core Image context.
+    private var renderContext: CIContext?
+    var ciContext: CIContext {
+        if let renderContext { return renderContext }
+        let context = CIContext()
+        renderContext = context
+        return context
+    }
+    private let workMonitor = VideoWorkMonitor()
+    // The XPC watchdog may read these from its own queue; the monitor synchronizes them.
+    @objc public var hasPendingVideoWork: Bool { workMonitor.hasPendingWork }
+    @objc public var hasStalledVideoWork: Bool { workMonitor.hasStalledWork }
     var referencePixelBuffer: CVPixelBuffer?
     var scaledReferencePixelBuffer: CVPixelBuffer?
     
@@ -59,12 +79,13 @@ import CoreImage
     private var notifiedConnected = false
     private var reconnectPending = false
     private var explicitlyStopped = false
+    private var deniedDeviceNames: Set<String> = []
     // Ecamm: Log negotiation and actual wire modes on this owner queue, not for every frame.
     private var lastLoggedPeerSupport: String?
     private var lastSentVideoType: VideoMessageType?
     private var lastReceivedVideoType: VideoMessageType?
     
-    public var hasConnection: Bool{
+    @objc public var hasConnection: Bool{
         connection != nil
     }
     
@@ -75,7 +96,7 @@ import CoreImage
         self.size = size
         self.delegate = delegate
         self.queue = queue
-        self.ciContext = ciContext ?? CIContext()
+        self.renderContext = ciContext
         super.init()
         startBonjourDiscovery()
     }
@@ -95,21 +116,19 @@ import CoreImage
                     self.scheduleReconnect()
                 }
             }else{
-                if let result = newResults.first {
-                    self.connectIfAuthorized(to: result)
-                }
+                self.start()
             }
         }
-        if let service = bonjourBrowser.browseResults.first{
-            connectIfAuthorized(to: service)
-        }
+        start()
         bonjourBrowser.start(queue: queue)
     }
     
 
     func start(){
         guard !explicitlyStopped, connection == nil else { return }
-        if let result = bonjourBrowser.browseResults.first{
+        let results = bonjourBrowser.browseResults
+        if let endpoint = nextVideoPencilEndpoint(in: results.map(\.endpoint), excluding: deniedDeviceNames),
+           let result = results.first(where: { $0.endpoint == endpoint }) {
             connectIfAuthorized(to: result)
         }
     }
@@ -144,8 +163,12 @@ import CoreImage
             self.queue.async { [weak self] in
                 guard let self, self.generation == requestedGeneration, self.authorizationPending else { return }
                 self.authorizationPending = false
-                guard allowed, !self.explicitlyStopped, self.connection == nil,
-                      self.bonjourBrowser.browseResults.contains(where: { $0.endpoint == result.endpoint }) else { return }
+                if !allowed { self.deniedDeviceNames.insert(name) }
+                guard !self.explicitlyStopped, self.connection == nil else { return }
+                guard allowed, self.bonjourBrowser.browseResults.contains(where: { $0.endpoint == result.endpoint }) else {
+                    self.start() // Continue through candidates; do not repeatedly prompt for a denial.
+                    return
+                }
                 self.connectTo_iPad(at: result)
             }
         }
@@ -243,7 +266,8 @@ import CoreImage
             log(message: "Invalid Video Pencil encoder size: \(size)", color: .systemRed)
             return
         }
-        encoder = H265Encoder(width: width, height: height, bitRate: encoderBitRate, fps: 30, callbackQueue: queue, delegate: self)
+        guard !workMonitor.hasStalledWork else { return } // Let the watchdog retire a wedged helper.
+        encoder = H265Encoder(width: width, height: height, bitRate: encoderBitRate, fps: 30, callbackQueue: queue, delegate: self, workMonitor: workMonitor)
         guard encoder?.isReady == true else {
             encoder?.invalidate()
             encoder = nil
@@ -371,7 +395,7 @@ import CoreImage
     var decoder: H265Decoder?
     func createDecoderIfNeeded(){
         if decoder == nil {
-            decoder = H265Decoder(width: 1920, height: 1080, callbackQueue: queue)
+            decoder = H265Decoder(width: 1920, height: 1080, callbackQueue: queue, workMonitor: workMonitor)
             decoder?.delegate = self
         }
     }
@@ -451,7 +475,25 @@ import CoreImage
     }
 
     @objc public func reconnect() {
-        queue.async { [weak self] in self?.explicitlyStopped = false; self?.start() }
+        queue.async { [weak self] in
+            self?.explicitlyStopped = false
+            self?.deniedDeviceNames.removeAll()
+            self?.start()
+        }
+    }
+
+    @objc public func refreshPermissions(forDeviceIdentifier identifier: String, allowed: Bool) {
+        // Ecamm: Revoking one iPad must not stop discovery of other approved devices.
+        // Recheck other previously denied devices, but do not immediately reprompt for the revoked row.
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.deniedDeviceNames.removeAll()
+            if !allowed {
+                self.deniedDeviceNames.insert(identifier)
+                if self.remoteDeviceIdentifier == identifier { self.stop() }
+            }
+            self.start() // Explicit sleep/user-switch disconnects still suppress this.
+        }
     }
 
     deinit {
@@ -540,10 +582,19 @@ extension VideoPencilClient: H265EncoderDelegate{
         let message = NWProtocolFramer.Message(videoMessageType: messageType)
         let context = NWConnection.ContentContext(identifier: "videoFrame", metadata: [message])
 //        log(message: "Sending everything in one go", color: .systemGreen)
-        connection.send(content: payload, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self] error in
+        guard let token = workMonitor.begin(.send, bytes: payload.count) else {
+            // Ecamm: Reset the entire prediction stream on sustained overload, never discard one P-frame.
+            log(message: "Video send backlog exceeded safety limit; reconnecting", color: .systemRed)
+            tryReconnecting()
+            return
+        }
+        let monitor = workMonitor
+        connection.send(content: payload, contentContext: context, isComplete: true, completion: .contentProcessed({ [weak self, weak connection] error in
+            monitor.finish(token)
+            guard let self, let connection, connection === self.connection else { return }
             if let error = error {
-                self?.log(message: "Error sending encoded video:" + error.debugDescription, color: .red)
-
+                self.log(message: "Error sending encoded video:" + error.debugDescription, color: .red)
+                self.tryReconnecting()
             }
         }))
     }

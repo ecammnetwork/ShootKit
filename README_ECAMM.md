@@ -31,7 +31,12 @@ the earlier attempts to change codec/network timing to cure that glitch.
   Existing hosts without this callback keep automatic connection behavior.
 - Bonjour names are exposed to the host; they are **not authenticated identity**.
 - `disconnect()` suppresses automatic reconnection until the host explicitly
-  calls `reconnect()`. Ecamm uses this for revocation, sleep, and user switching.
+  calls `reconnect()`. Ecamm uses this for sleep and user switching. Device-specific
+  revocation uses `refreshPermissions(forDeviceIdentifier:allowed:)` so another
+  approved iPad remains discoverable without reprompting for the revoked row.
+- Discovery selects a stable eligible Bonjour name, skips declined names for the
+  session, and advances after denial or disappearance during approval. Explicit
+  reconnect/permission refresh rechecks eligibility; name-based trust is unchanged.
 - Weak discovery/connection handlers and connection-generation checks reject
   obsolete approvals, receives, retries, and codec callbacks.
 - Teardown clears callbacks, cancels connections, and invalidates codecs.
@@ -68,6 +73,10 @@ the earlier attempts to change codec/network timing to cure that glitch.
   again. This establishes protocol use, not the iPad's actual playback behavior.
 - An optional streaming-state callback lets Ecamm stop preparing source frames
   when the iPad cancels its stream, even if the TCP connection remains open.
+- The optional Core Image context is now lazy. Bonjour discovery and direct
+  pixel-buffer inputs do not allocate a second GPU context. Ecamm also creates
+  its helper's snapshot context/pool only for the first requested frame and releases
+  them when streaming stops. Idle discovery has no periodic watchdog timer.
 - Decoder output is IOSurface-backed for the helper's cross-process handoff.
 - Encoder dimensions honor the client's requested `size`, with checked integer
   conversion. Ecamm's 540p smoothness comparison supplies 960x540 snapshots;
@@ -148,14 +157,40 @@ codec settings remain. The following records the experiment for Michael:
 
 ## Deliberately excluded
 
-There is no custom 30-fps source scheduler, encoder submission window, decoder
-FIFO/submission window, compressed-frame replacement, send FIFO, keyframe
+There is no custom 30-fps source scheduler, encoder pacing window, decoder
+FIFO/pacing window, compressed-frame replacement, send FIFO, keyframe
 resynchronization policy, forced flush, TCP_NODELAY change, or experimental
 frame-rate/keyframe-interval tuning. Apart from Michael's upstream timestamp
 playout and the explicit feed size/bitrate settings above, original codec settings
 and ordered sends remain.
-Per-message limits are not a claim that all internal
-Network/VideoToolbox queues have bounded total memory.
+The safety ceilings below do not attempt to smooth normal codec or network bursts.
+
+## Shipping safety ceilings and codec liveness
+
+`VideoWorkMonitor` accounts for queued work through actual codec/delegate or
+Network send completion, including retired codecs during reconnect. It uses a
+short helper-only lock; Ecamm's render thread never calls it or waits for it.
+
+- At most 32 encoder inputs and 32 decoder jobs (16 MiB compressed input total)
+  can be outstanding. This includes decoded images awaiting delegate delivery.
+  Parameter changes share decoder admission so flooding them cannot bypass it.
+- At most 120 encoded sends / 8 MiB may await `contentProcessed`. These are
+  generous failure ceilings, not a new FIFO, one-frame send window, or pacing.
+- Raw encoder inputs may be skipped before submission. Decoder/send overload
+  reconnects the entire prediction stream; it never drops a compressed frame
+  and continues using later dependent frames. Ordinary keyframe bursts are unchanged.
+- The host can read `hasPendingVideoWork` / `hasStalledVideoWork` safely from its
+  watchdog. Work older than five seconds, or more than 16 pending teardowns,
+  is considered stuck. Fresh service-queue heartbeats cannot conceal it.
+- Explicit invalidation is itself tracked. Cancelled-frame accounting is cleared
+  only after invalidation returns, since VideoToolbox may discard frames without
+  callbacks. Parameter replacement clears old submitted frames but preserves
+  new inputs still queued. Callback completion accounting is idempotent.
+- Ecamm starts its watchdog before an allowed connection and keeps it alive
+  through pending teardown; after disconnect/cleanup it stops. A stall exits only
+  the disposable helper, allowing Ecamm's existing asynchronous restart path to act.
+  No active stream means no idle-frame timeout. These limits bound our admitted
+  work, not every private allocation inside VideoToolbox or Network.framework.
 
 There is no TLS or cryptographic device identity. Approval still trusts the
 Bonjour service name on the local network, as explicitly chosen for Ecamm.
