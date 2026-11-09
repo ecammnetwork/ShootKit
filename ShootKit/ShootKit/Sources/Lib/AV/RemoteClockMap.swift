@@ -19,6 +19,8 @@ final class RemoteClockMap {
     /// The estimate may rise only as fast as real clock drift (about 150 ppm at 30 fps).
     /// A standing backlog must show up as late frames, not be absorbed as a new offset.
     private let maximumIncreasePerFrame: TimeInterval = 0.000005
+    /// A frame arriving this much sooner than the estimate allows means the sender's clock jumped
+    private let maximumClockStep: TimeInterval = 1.0
 
     /// One measurement per recent frame of how far the receiver's clock is ahead of the sender's.
     /// Each is too large by however long that frame spent in transit, so the smallest is the most accurate.
@@ -41,15 +43,24 @@ final class RemoteClockMap {
     func displayHostTime(forSenderPresentationTimeStamp senderPresentationTimeStamp: CMTime,
                          arrivalHostTime: CMTime = CMClockGetTime(CMClockGetHostTimeClock())) -> CMTime {
         // Ecamm: Reject invalid arithmetic, and re-anchor after a peer clock reset or sleep.
+        // Upstream now handles forward sender jumps below; keep only the backward/receiver-side check here.
         guard senderPresentationTimeStamp.isNumeric, arrivalHostTime.isNumeric else { return .invalid }
         if let sender = previousSenderTime, let arrival = previousArrivalTime,
            senderPresentationTimeStamp.seconds < sender ||
-            abs((senderPresentationTimeStamp.seconds - sender) - (arrivalHostTime.seconds - arrival)) > 2 {
+            (arrivalHostTime.seconds - arrival) - (senderPresentationTimeStamp.seconds - sender) > 2 {
+            reset()
+        }
+        let clockOffsetMeasurement = arrivalHostTime.seconds - senderPresentationTimeStamp.seconds
+        // A frame can only beat the estimate by its transit time's jitter. Far more than that, and
+        // the sender's clock has jumped forward (its timestamps restarted): the estimate's slow
+        // fall would take a long time to absorb it, holding every frame back by the jump
+        // (once 18.8 s, for over half an hour), so start measuring again
+        if let estimatedClockOffset, estimatedClockOffset - clockOffsetMeasurement > maximumClockStep {
+            // Ecamm: Reset our monotonic-display floor and history too, not just upstream's offset estimate.
             reset()
         }
         previousSenderTime = senderPresentationTimeStamp.seconds
         previousArrivalTime = arrivalHostTime.seconds
-        let clockOffsetMeasurement = arrivalHostTime.seconds - senderPresentationTimeStamp.seconds
         recentClockOffsetMeasurements.append(clockOffsetMeasurement)
         if recentClockOffsetMeasurements.count > clockOffsetMeasurementsToKeep {
             recentClockOffsetMeasurements.removeFirst()

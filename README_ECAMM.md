@@ -2,7 +2,7 @@
 
 This branch, `codex/ecamm-xpc`, starts at Michael's original ShootKit revision
 `5f83909083316e8c60b4b254844f03d6ccb5450d` and now merges Michael's main through
-`361d3a81e6630a5eb6323f1542087cdfe8cbbb4f` (timestamp protocol, October 10, 2026).
+`10ab9f95a26f09459f4c5ea1f22a909594156567` (received-drawing pacing, November 9, 2026).
 It is independent of the older
 `ecamm` branch and its experimental streaming changes. Changes below are marked
 with practical `Ecamm:` comments in the source to make upstream review easier.
@@ -10,6 +10,34 @@ with practical `Ecamm:` comments in the source to make upstream review easier.
 The periodic iPad playback glitch reproduced outside Ecamm with unmodified
 ShootKit. This branch therefore keeps safety and host-integration fixes, **not**
 the earlier attempts to change codec/network timing to cure that glitch.
+
+## November 9 upstream merge (ShootKit 1.1.0)
+
+- Michael added `DecodedFrameSchedule`: a twelve-frame bounded drawing queue and
+  60 Hz delegate delivery at mapped display times. `pacesReceivedFrames` defaults
+  to true for hosts that do not already schedule their overlays. This affects
+  drawings received from the iPad, not the Mac's outgoing feed or encoder settings.
+- Ecamm explicitly opts out (`pacesReceivedFrames = NO`) because its existing
+  background XPC bridge already publishes drawings at their host-clock PTS.
+  This avoids scheduling twice and adding a 60 Hz helper timer. The standalone
+  sender diagnostic uses upstream pacing because its preview otherwise shows
+  each drawing immediately. No work moved onto Ecamm's render thread.
+- Integrated the new schedule with our cancellation paths: obsolete decoders
+  remain rejected, stop/deinit cancels the timer and clears frames immediately
+  on the owner queue, and opting out or receiving legacy frames discards pending
+  paced frames. Upstream's extra async cleanup could race the next connection
+  or keep a revoked drawing pending, so it is intentionally not used here.
+- Michael's >1-second forward-clock reset replaces the forward half of our older
+  >2-second discontinuity check. We retain backward-clock/receiver-side resets,
+  numeric validation, explicit parameter resets, and monotonic display times.
+  His reset uses our shared reset routine so the extra history clears as well.
+- Upstream's podspec now requires macOS 12, matching our existing requirement;
+  the separate deployment-target value override is therefore no longer needed.
+  Version 1.1.0 and his new source/project entries are included. The standalone
+  Xcode target also now includes our existing VideoWorkMonitor (Pods already did).
+- Our ownership, permission/re-prompt, logging, hardware-encoding, bitrate-unit,
+  bounded-work/watchdog, lazy-context, and wire-validation fixes remain necessary.
+  Ecamm's direct pixel-buffer color fix stays in its helper, unchanged.
 
 ## Changes retained, and why
 
@@ -157,16 +185,18 @@ codec settings remain. The following records the experiment for Michael:
   an owned drawing when due, with an eight-buffer bound and a generation guard
   against post-disconnect drawings. The helper reply acknowledges the copy, not
   the future display time. Nothing waits or schedules playback on the render thread.
+  With ShootKit 1.1.0 it opts out of the new framework-level drawing scheduler.
 - The independent Mac test receiver now negotiates this same upstream wire format,
   while retaining its diagnostic fixed 250 ms playback cushion.
 
 ## Deliberately excluded
 
-There is no custom 30-fps source scheduler, encoder pacing window, decoder
+There is no Ecamm-specific 30-fps source scheduler, encoder pacing window, decoder
 FIFO/pacing window, compressed-frame replacement, send FIFO, keyframe
 resynchronization policy, forced flush, TCP_NODELAY change, or experimental
 frame-rate/keyframe-interval tuning. Apart from Michael's upstream timestamp
-playout and the explicit feed size/bitrate settings above, original codec settings
+playout (including his new optional received-drawing scheduler) and the explicit
+feed size/bitrate settings above, original codec settings
 and ordered sends remain.
 The safety ceilings below do not attempt to smooth normal codec or network bursts.
 

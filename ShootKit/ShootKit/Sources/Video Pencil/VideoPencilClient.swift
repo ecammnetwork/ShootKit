@@ -395,6 +395,20 @@ func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: 
     /// What Video Pencil has told us it can receive. Nil until its capabilities message arrives.
     var capabilitiesReceivedFromPeer: PeerCapabilities?
     var decoder: H265Decoder?
+
+    /// Drawing frames are handed to the delegate evenly, each at its display time (a few
+    /// hundredths of a second after it was drawn), rather than the moment they decode: the
+    /// network delivers them in bunches, which made the drawing look jerky. Turn off to get each
+    /// frame as soon as it's decoded and pace them yourself
+    @objc public var pacesReceivedFrames = true {
+        didSet {
+            // Ecamm: Set on the owner queue. Opting out must also discard any already-paced drawings.
+            if !pacesReceivedFrames { stopPacing() }
+        }
+    }
+    let frameSchedule = DecodedFrameSchedule<CVPixelBuffer>()
+    var pacingTimer: DispatchSourceTimer?
+    static let pacingRate = 60
     func createDecoderIfNeeded(){
         if decoder == nil {
             decoder = H265Decoder(width: 1920, height: 1080, callbackQueue: queue, workMonitor: workMonitor)
@@ -462,6 +476,7 @@ func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: 
         cancelVideoStream()
         decoder?.invalidate()
         decoder = nil
+        stopPacing()
         if notifiedConnected {
             notifiedConnected = false
             DispatchQueue.main.async { [weak self] in
@@ -507,6 +522,7 @@ func nextVideoPencilEndpoint(in endpoints: [NWEndpoint], excluding deniedNames: 
         connection?.cancel()
         encoder?.invalidate()
         decoder?.invalidate()
+        stopPacing()
     }
 }
 
@@ -622,10 +638,55 @@ extension VideoPencilClient: ConnectionLogger{
 
 extension VideoPencilClient: H265DecoderDelegate{
     
+    // on `queue`
     func videoDecoderDidDecodePixelBuffer(_ decoder: H265Decoder, pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
         // Ecamm: A cancelled decoder cannot publish drawings into its replacement.
         guard decoder === self.decoder else { return }
+        // Timed frames (Video Pencil 2.1 and later) carry their display time on this Mac's host
+        // clock: they wait for it. Untimed ones, from older versions, go straight out
+        guard pacesReceivedFrames, presentationTimeStamp.isValid else {
+            // Ecamm: A legacy/immediate frame supersedes drawings queued under the previous timing mode.
+            stopPacing()
+            deliver(pixelBuffer, presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
+            return
+        }
+        frameSchedule.add(pixelBuffer, displayTime: presentationTimeStamp, duration: presentationDuration)
+        startPacingIfNeeded()
+    }
+
+    private func deliver(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime, presentationDuration: CMTime) {
         delegate?.videoPencilDidReceive(from: self, frame: CIImage(cvPixelBuffer: pixelBuffer), presentationTimeStamp: presentationTimeStamp, presentationDuration: presentationDuration)
+    }
+
+    /// Ticks at 60 a second and hands on whichever frame is due, so frames go out as evenly as
+    /// they were drawn (they arrive bunched by the network and the decoder)
+    private func startPacingIfNeeded() {
+        guard pacingTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(Int(1_000_000_000 / Self.pacingRate)), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.deliverDueFrame()
+        }
+        pacingTimer = timer
+        timer.resume()
+    }
+
+    private func deliverDueFrame() {
+        // Ecamm: A cancelled timer may already have a callback queued; it must not publish stale drawings.
+        guard pacingTimer != nil, pacesReceivedFrames else { return }
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        let refreshInterval = CMTime(value: 1, timescale: CMTimeScale(Self.pacingRate))
+        guard let due = frameSchedule.takeFrameToShow(atRefreshTime: now, refreshInterval: refreshInterval) else { return }
+        deliver(due.frame, presentationTimeStamp: due.displayTime, presentationDuration: due.duration)
+    }
+
+    func stopPacing() {
+        // Ecamm: Called on the owner queue (or deinit), just like codec/connection teardown.
+        // Enqueuing another block here could clear a replacement stream, deliver a revoked drawing
+        // before cleanup, or retain self during deinit. Cancel synchronously; never wait for the timer.
+        pacingTimer?.cancel()
+        pacingTimer = nil
+        frameSchedule.removeAll()
     }
     
     func videoDecoder(_ decoder: H265Decoder, failedWith error: OSStatus) {
